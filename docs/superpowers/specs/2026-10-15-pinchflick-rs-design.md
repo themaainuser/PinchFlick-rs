@@ -226,3 +226,24 @@ Consequences:
   INCLUDE/LIB/PATH directly). A zombie Dec-2025 BuildTools install â€” one
   whose Windows SDK had been silently skipped â€” blocked every repair until
   it was uninstalled and reinstalled clean with VCTools + Win11SDK 26100.
+
+## 13. M1 results (2026-10-15) — ort route PASSES
+
+Models: `takoyakisoft/vtuberkit-vision-landmarkers-onnx` (converted from the
+official MediaPipe `.task` bundles; SHA256 verified against the model card).
+Runtime: `ort` 2.0.0-rc.14 + onnxruntime, CPU, this machine.
+
+| stage | input | outputs | avg | min |
+|---|---|---|---|---|
+| palm_detector | [1,192,192,3] | [1,2016,18] anchors, [1,2016,1] scores | **5.67 ms** | 4.92 ms |
+| hand_landmark | [1,224,224,3] | [1,63] landmarks, [1,1] flag, [1,1] score, [1,63] world | **3.82 ms** | 3.17 ms |
+| hand_recrop | [1,256,256,3] | [1,1,1,4] bbox | (metadata probe only) | — |
+
+Combined ~**9.5 ms/frame** on CPU — inside the 15 ms budget with headroom
+for the detect-every-N tracking policy. **M1 gate: PASS.** Sanity: a
+no-hand center crop scored flag=0.0017 (correct rejection); session loads
+take ~35 ms each, once at startup. onnxruntime DLL size measured at M5.
+
+Deferred to M2 as scoped: palm-anchor decode ([1,2016,18] -> boxes),
+crop-affine for the landmark model, presence gating, tracking policy, and
+the gesture-engine port with its 25 parity tests.
