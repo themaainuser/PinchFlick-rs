@@ -53,7 +53,11 @@ mod tests {
         "/../PinchFlick/hand_landmarker.task"
     );
 
+    // Fixture lives in the sibling PinchFlick repo (local only) — a fresh
+    // clone / CI windows-latest has neither. Ignored by default so plain
+    // `cargo test` passes everywhere; run locally with `cargo test -- --ignored`.
     #[test]
+    #[ignore = "needs ../PinchFlick/hand_landmarker.task (absent on fresh clone/CI)"]
     fn task_archive_yields_both_tflite_models() {
         let bytes = std::fs::read(TASK).expect("hand_landmarker.task readable");
         let m = extract_models_from_task(&bytes).expect("extraction succeeds");
