@@ -8,3 +8,6 @@ frame.png
 # ONNX models (Apache-2.0; download URLs + SHA256 in the spec, section 13)
 models/
 
+
+dump_out.txt
+
