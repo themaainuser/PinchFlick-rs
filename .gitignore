@@ -1,1 +1,6 @@
 /target
+
+# local camera capture (privacy) and SDD workspace
+frame.png
+.superpowers/
+

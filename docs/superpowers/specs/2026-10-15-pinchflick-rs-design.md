@@ -193,3 +193,36 @@ A fresh-builder review raised five questions; all are resolved above
    at M1 (optimize → accept v1-parity 25 fps → ort → document honestly).
 5. **Automated OS-seam harness** → out of the milestones (manual M3
    checklist + synthetic-title parity tests); optional M6 later.
+
+## 12. M0 results (2026-10-15)
+
+**Verdict: tract FAILS — the pre-designed ort + ONNX fallback (§5, §11.4)
+takes over.**
+
+Both models in `hand_landmarker.task` store weights as float16 constants
+consumed by `DEQUANTIZE` ops. tract 0.23.8 rejects that op at proto
+translation — "Unsupported: builtin_code: DEQUANTIZE … inputs: F16" — so
+neither model even finishes loading, before any inference runs. Confirmed
+independently for `hand_detector.tflite` (opcode DEQUANTIZE, F16 blob) and
+`hand_landmarks_detector.tflite` (same op, same shape of failure).
+
+What the spike proved and stays reusable:
+
+- in-memory extraction of both `.tflite`s from the `.task` zip (3/3 unit
+  tests green: archive extraction, nearest resize, [-1,1] normalization)
+- the load → shape-probe → warmup → timed-runs harness in `src/main.rs`
+- a fully static tract build weighs **13.8 MB** — proof the size thesis
+  holds even though this engine can't run these two models
+
+Consequences:
+
+- **M1 re-scoped:** obtain ONNX conversions of both models (community
+  conversions of the palm-detection and hand-landmark graphs exist; their
+  validation is the next spike's job), run them via `ort` — accepting the
+  ~15–20 MB onnxruntime DLLs, still >15× under the Python stack. Timing
+  budget re-measured there.
+- Build note for this machine: cargo needs the `vcvars64.bat` wrapper
+  (VS instance registration never became visible to vswhere; vcvars sets
+  INCLUDE/LIB/PATH directly). A zombie Dec-2025 BuildTools install — one
+  whose Windows SDK had been silently skipped — blocked every repair until
+  it was uninstalled and reinstalled clean with VCTools + Win11SDK 26100.
