@@ -11,3 +11,10 @@ models/
 
 dump_out.txt
 
+
+# test-run scratch output
+red_run.txt
+green_run.txt
+phase2.txt
+final_verify.txt
+

@@ -1,6 +1,10 @@
 // M0 spike pure logic: .task archive extraction + image prep (TDD'd).
 // The tract inference experiment itself lives in main.rs (design doc M0).
 
+// M0's tested .task-extraction skeleton (ledger: "reusable skeleton kept");
+// unused since the ONNX switch, kept for the record.
+#![allow(dead_code)]
+
 pub struct TaskModels {
     pub detector: Vec<u8>,
     pub landmarks: Vec<u8>,
