@@ -45,6 +45,24 @@ pub fn letterbox_normalize(rgb: &[u8], width: u32, height: u32, size: u32) -> Ve
     out
 }
 
+/// v1 parity: `cv2.flip(frame, 1)` when `mirror_display` is true
+/// (controller.py:180) — horizontal mirror of the RGB frame, applied BEFORE
+/// inference.
+pub fn mirror_rgb(buf: &mut [u8], width: u32, height: u32) {
+    let w = width as usize;
+    if w == 0 {
+        return;
+    }
+    for y in 0..height as usize {
+        let row = &mut buf[y * w * 3..(y + 1) * w * 3];
+        for x in 0..w / 2 {
+            for c in 0..3 {
+                row.swap(x * 3 + c, (w - 1 - x) * 3 + c);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,5 +107,23 @@ mod tests {
         let out = letterbox_normalize(&rgb, 640, 480, 192);
         let v = out[((96 * 192 + 96) * 3) as usize];
         assert!((v - 128.0 / 255.0).abs() < 1e-6, "128/255 = {}, got {v}", 128.0 / 255.0);
+    }
+
+    #[test]
+    fn mirror_rgb_swaps_columns_like_cv2_flip_1() {
+        // 2x2, distinct pixels per cell: rows [A B] / [C D] -> [B A] / [D C].
+        let mut buf = vec![10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120];
+        mirror_rgb(&mut buf, 2, 2);
+        assert_eq!(
+            buf,
+            vec![40, 50, 60, 10, 20, 30, 100, 110, 120, 70, 80, 90]
+        );
+        // Odd width: the middle column stays put.
+        let mut odd = vec![1, 2, 3, 4, 5, 6, 7, 8, 9];
+        mirror_rgb(&mut odd, 3, 1);
+        assert_eq!(odd, vec![7, 8, 9, 4, 5, 6, 1, 2, 3]);
+        // No-op on empty frames must not panic.
+        let mut none: Vec<u8> = Vec::new();
+        mirror_rgb(&mut none, 0, 0);
     }
 }

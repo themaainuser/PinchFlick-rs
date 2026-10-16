@@ -28,12 +28,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .and_then(|s| s.parse().ok())
             .unwrap_or(3)
     });
+    let live_mode = args.iter().any(|a| a == "--live");
+    let config_path = args
+        .iter()
+        .position(|a| a == "--config")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
+    let camera_override = args
+        .iter()
+        .position(|a| a == "--camera")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse::<i64>().ok());
+
+    let environment = ort::init().with_name("pinchflick-rs").build()?;
+
+    if live_mode {
+        return run_live(&environment, config_path, camera_override);
+    }
+
     let img = image::open(&frame_path)?.to_rgb8();
     let (fw, fh) = img.dimensions();
     let fbytes = img.as_raw();
     println!("frame: {fw}x{fh} ({frame_path})");
-
-    let environment = ort::init().with_name("pinchflick-rs").build()?;
 
     if video_iters.is_some() {
         return run_video(&environment, &img, fw, fh, video_iters.unwrap_or(3));
@@ -62,6 +78,237 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  out {o:?}");
     }
 
+    Ok(())
+}
+
+/// M3.5 live CLI loop — camera -> Pipeline -> GestureEngine -> console
+/// echo + rolling FPS/stage timings. DRY RUN: actions are printed, not
+/// injected (enigo injection is M3.6). Mirrors v1's controller loop
+/// (controller.py `run()`): mirror before inference, strictly increasing
+/// VIDEO timestamps, YouTubeDetector polled at its interval.
+fn run_live(
+    environment: &Environment,
+    config_path: Option<String>,
+    camera_override: Option<i64>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use pinchflick_rs::config;
+    use pinchflick_rs::gestures::engine::{GestureEngine, Landmark};
+    use pinchflick_rs::gestures::seek::seek_key_sequence;
+    use pinchflick_rs::sys::title::YouTubeDetector;
+    use pinchflick_rs::track::{capture::Capture, inference::Pipeline};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let mut cfg = config::load_config(config_path.as_deref())?;
+    if let Some(idx) = camera_override {
+        cfg.camera_index = idx;
+    }
+
+    let mut engine = GestureEngine::new(&cfg, cfg.mirror_display);
+    let mut ytd = YouTubeDetector::new(
+        cfg.youtube_title_markers.clone(),
+        cfg.youtube_check_interval_ms,
+    );
+    let mut capture = Capture::open(
+        cfg.camera_index,
+        cfg.frame_width,
+        cfg.frame_height,
+        cfg.mirror_display,
+    )
+    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    let mut pipeline = Pipeline::new(
+        environment,
+        cfg.min_detection_confidence,
+        cfg.min_tracking_confidence,
+    )?;
+
+    println!();
+    println!("PinchFlick running (CLI dry-run; injection arrives in M3.6).");
+    println!("  scroll : 1 finger = up, 2 fingers = down (works everywhere)");
+    println!(
+        "  seek   : double-pinch left/right = -/+{}s ({})",
+        cfg.seek_seconds,
+        if cfg.seek_requires_youtube {
+            "YouTube tab must be focused"
+        } else {
+            "anywhere"
+        }
+    );
+    println!("  keys   : q = quit (console)");
+    println!("  note   : click your video window first -- seeks only fire while it's focused");
+    println!();
+
+    let quit = Arc::new(AtomicBool::new(false));
+    {
+        let quit = Arc::clone(&quit);
+        std::thread::spawn(move || {
+            use std::io::BufRead as _;
+            let stdin = std::io::stdin();
+            for line in stdin.lock().lines() {
+                match line {
+                    Ok(l) if l.trim() == "q" => {
+                        quit.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                    Ok(_) => {}
+                    Err(_) => return,
+                }
+            }
+        });
+    }
+
+    let t0 = Instant::now();
+    let mut last_ts = -1i64;
+    let mut stop_reason = "quit (q)";
+    // v1's stats dict.
+    let mut frames = 0u64;
+    let mut hand_frames = 0u64;
+    let mut seeks = 0u64;
+    let mut scroll_events = 0u64;
+    let mut wheel = 0i64;
+    // Rolling 2 s window for the stage report.
+    let mut win_start = Instant::now();
+    let mut win_frames = 0u64;
+    let mut win_wait_ms = 0f64;
+    let mut win_decode_ms = 0f64;
+    let mut win_hand = 0u64;
+    let mut win_detects = 0u64;
+    let mut win_detect_ms = 0f64;
+    let mut win_landmark_ms = 0f64;
+    let mut win_landmark_n = 0u64;
+
+    'live: loop {
+        if quit.load(Ordering::SeqCst) {
+            break 'live;
+        }
+        let (rgb, w, h) = match capture.capture() {
+            Ok(v) => v,
+            Err(e) => {
+                stop_reason = "camera stopped delivering frames";
+                println!("[capture error] {e}");
+                break 'live;
+            }
+        };
+
+        let mut ts = t0.elapsed().as_millis() as i64;
+        if ts <= last_ts {
+            ts = last_ts + 1; // VIDEO mode demands strictly increasing stamps
+        }
+        last_ts = ts;
+
+        let out = match pipeline.process(&rgb, w, h) {
+            Ok(o) => o,
+            Err(e) => {
+                stop_reason = "inference error";
+                println!("[pipeline error] {e}");
+                break 'live;
+            }
+        };
+        frames += 1;
+        win_frames += 1;
+        win_wait_ms += capture.last_wait_ms;
+        win_decode_ms += capture.last_decode_ms;
+        if out.landmarks.is_some() {
+            hand_frames += 1;
+            win_hand += 1;
+        }
+        if !out.detect_ms.is_zero() {
+            win_detects += 1;
+            win_detect_ms += out.detect_ms.as_secs_f64() * 1e3;
+        }
+        if !out.landmark_ms.is_zero() {
+            win_landmark_n += 1;
+            win_landmark_ms += out.landmark_ms.as_secs_f64() * 1e3;
+        }
+
+        let landmarks = out.landmarks.as_ref().map(|lms| {
+            lms.iter()
+                .map(|l| Landmark::new(l[0] as f64, l[1] as f64))
+                .collect::<Vec<_>>()
+        });
+        let (on_youtube, _title) = ytd.check(ts, false);
+        let res = engine.frame(landmarks.as_deref(), ts, on_youtube);
+
+        // ---- act: scroll (anywhere) — printed only until M3.6 ----
+        if res.scroll_clicks != 0 {
+            scroll_events += 1;
+            wheel += res.scroll_clicks as i64;
+            println!("[scroll] {:+} clicks (dry-run)", res.scroll_clicks);
+        }
+
+        // ---- act: seek (engine already YouTube-gates it) ----
+        if let Some(dir) = res.seek {
+            match seek_key_sequence(cfg.seek_seconds, dir.as_str(), &cfg.seek_keys) {
+                Ok(seq) => {
+                    seeks += 1;
+                    let arrow = if dir.as_str() == "backward" { "-" } else { "+" };
+                    println!(
+                        "[seek] {arrow}{}s ({}) (dry-run)",
+                        cfg.seek_seconds,
+                        seq.join(" + ")
+                    );
+                }
+                Err(e) => println!("[seek error] {e}"),
+            }
+        }
+        if let Some(blocked) = &res.seek_blocked {
+            println!("[seek blocked] {blocked}");
+        }
+        if res.tap.is_some() && res.seek.is_none() {
+            println!("[tap] {} - double-pinch again to seek", res.tap_status);
+        }
+
+        if win_start.elapsed().as_secs_f64() >= 2.0 {
+            let secs = win_start.elapsed().as_secs_f64();
+            let fps = win_frames as f64 / secs;
+            let det_avg = if win_detects > 0 {
+                win_detect_ms / win_detects as f64
+            } else {
+                0.0
+            };
+            let lmk_avg = if win_landmark_n > 0 {
+                win_landmark_ms / win_landmark_n as f64
+            } else {
+                0.0
+            };
+            let wait_avg = if win_frames > 0 {
+                win_wait_ms / win_frames as f64
+            } else {
+                0.0
+            };
+            let decode_avg = if win_frames > 0 {
+                win_decode_ms / win_frames as f64
+            } else {
+                0.0
+            };
+            println!(
+                "[stats] {fps:.1} fps | hand {}% | wait {wait_avg:.1}ms | decode {decode_avg:.1}ms | detect {det_avg:.1}ms ({} runs) | landmark {lmk_avg:.1}ms | total {frames}",
+                if win_frames > 0 {
+                    win_hand * 100 / win_frames
+                } else {
+                    0
+                },
+                win_detects
+            );
+            win_start = Instant::now();
+            win_frames = 0;
+            win_wait_ms = 0.0;
+            win_decode_ms = 0.0;
+            win_hand = 0;
+            win_detects = 0;
+            win_detect_ms = 0.0;
+            win_landmark_ms = 0.0;
+            win_landmark_n = 0;
+        }
+    }
+
+    let total = t0.elapsed().as_secs_f64();
+    println!();
+    println!("Stopped: {stop_reason}");
+    println!(
+        "  frames {frames} ({:.1} fps avg) | hand {hand_frames} | seeks {seeks} | scroll events {scroll_events} | wheel {wheel:+}",
+        if total > 0.0 { frames as f64 / total } else { 0.0 }
+    );
     Ok(())
 }
 

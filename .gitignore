@@ -25,6 +25,26 @@ dump_out.txt
 
 # test-run scratch output (pattern, not an explicit list)
 *_run.txt
+*_err*.txt
 phase*.txt
 final_verify.txt
+# M3.5 fps-diagnosis A/B artifacts (evidence lives in the ledger + VENDOR-NOTICE.md)
+ab_*.txt
+cv_*.txt
+cv2seq*.txt
+combo_*.txt
+ctrl_*.txt
+dump_*.txt
+fin_*.txt
+fmt_dump_*.txt
+live_*.txt
+long_*.txt
+mt_*.txt
+noset_*.txt
+patch_run*.txt
+prod_*.txt
+probe_*.txt
+readback_*.txt
+release_run*.txt
+rev_*.txt
 
