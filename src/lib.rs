@@ -7,3 +7,4 @@
 pub mod config;
 pub mod gestures;
 pub mod sys;
+pub mod vision;

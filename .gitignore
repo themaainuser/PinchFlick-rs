@@ -2,7 +2,12 @@
 
 # local camera capture (privacy) and SDD workspace
 frame.png
+frame_detected.png
+letterbox_debug.png
 .superpowers/
+
+# vendored mediapipe v1.1.1 reference sources (M3.1 parity research, re-fetched on demand)
+reference/
 
 
 # ONNX models (Apache-2.0; download URLs + SHA256 in the spec, section 13)
