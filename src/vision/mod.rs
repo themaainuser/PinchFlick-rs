@@ -8,3 +8,6 @@
 pub mod anchors;
 pub mod decode;
 pub mod image;
+pub mod landmark;
+pub mod rect;
+pub mod warp;

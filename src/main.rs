@@ -15,9 +15,14 @@ use ort::value::Tensor;
 use pinchflick_rs::vision::{anchors::generate_anchors, decode};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut args = std::env::args().skip(1);
-    let frame_path = args.next().unwrap_or_else(|| "frame.png".into());
-    let detect_mode = args.any(|a| a == "--detect");
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let frame_path = args
+        .iter()
+        .find(|a| !a.starts_with("--"))
+        .cloned()
+        .unwrap_or_else(|| "frame.png".into());
+    let detect_mode = args.iter().any(|a| a == "--detect");
+    let landmarks_mode = args.iter().any(|a| a == "--landmarks");
     let img = image::open(&frame_path)?.to_rgb8();
     let (fw, fh) = img.dimensions();
     let fbytes = img.as_raw();
@@ -25,6 +30,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let environment = ort::init().with_name("pinchflick-rs").build()?;
 
+    if landmarks_mode {
+        return run_landmarks(&environment, &img, fw, fh);
+    }
     if detect_mode {
         return run_detect(&environment, &img, fw, fh);
     }
@@ -199,6 +207,180 @@ fn run_detect(
     }
     out.save("frame_detected.png")?;
     println!("wrote frame_detected.png");
+    Ok(())
+}
+
+/// M3.3 visual gate: detect -> rect (rotation quirk + transform) -> rotated
+/// crop -> landmark model -> decode -> project -> annotated frame + JSON.
+/// Value range (0,1) for the landmark crop is the same empirical question
+/// the detector sweep answered; printed presence flag validates it.
+fn run_landmarks(
+    environment: &Environment,
+    img: &image::RgbImage,
+    fw: u32,
+    fh: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use pinchflick_rs::vision::{landmark, rect, warp};
+
+    let img_bytes = img.as_raw().clone();
+    // --- Stage 1: palm detection (M3.2 path, letterbox + v/255).
+    let mut det_session = Session::builder(environment)?.commit_from_file("models/palm_detector.onnx")?;
+    let input = pinchflick_rs::vision::image::letterbox_normalize(&img_bytes, fw, fh, 192);
+    let tensor = Tensor::from_array(([1i64, 192i64, 192i64, 3i64], input))?;
+    let outputs = det_session.run(ort::inputs![tensor])?;
+    let (boxes, scores) = {
+        let b = outputs["Identity"].try_extract_tensor::<f32>()?;
+        let s = outputs["Identity_1"].try_extract_tensor::<f32>()?;
+        (b.1.to_vec(), s.1.to_vec())
+    };
+    drop(outputs);
+    let anchors = generate_anchors();
+    let mut dets = decode::decode_detections(&boxes, &scores, &anchors, 0.6);
+    dets = decode::weighted_nms(&dets, 0.3);
+    decode::project_detections_to_image(&mut dets, fw, fh, 192);
+    let Some(det) = dets.first() else {
+        println!("no detection");
+        return Ok(());
+    };
+    println!(
+        "det: score {:.3} bbox [{:.3}, {:.3}, {:.3}, {:.3}]",
+        det.score, det.bbox[0], det.bbox[1], det.bbox[2], det.bbox[3]
+    );
+    for (i, kp) in det.keypoints.iter().enumerate() {
+        println!("  kp[{i}] ({:.3}, {:.3})", kp[0], kp[1]);
+    }
+
+    // --- Stage 2: rect (v1.1.1 HandDetectorGraph, verbatim incl. quirk).
+    let image_size = (fw as f32, fh as f32);
+    let rotation = rect::detection_rotation(det.keypoints[0], det.keypoints[2], image_size);
+    println!(
+        "rect rotation: {rotation:.5} rad ({:.2} deg)",
+        rotation.to_degrees()
+    );
+    let (x_center, y_center, width, height) = rect::norm_rect_from_keypoints(&det.keypoints);
+    let raw_rect = rect::NormRect {
+        x_center,
+        y_center,
+        width,
+        height,
+        rotation,
+    };
+    let hand_rect = rect::transform_rect(
+        &raw_rect,
+        image_size,
+        rect::DETECT_SCALE,
+        rect::DETECT_SCALE,
+        rect::DETECT_SHIFT_X,
+        rect::DETECT_SHIFT_Y,
+    );
+    println!(
+        "hand_rect: center ({:.3}, {:.3}) size ({:.3}, {:.3}) rot {:.3}",
+        hand_rect.x_center, hand_rect.y_center, hand_rect.width, hand_rect.height, hand_rect.rotation
+    );
+    // Square-in-pixels check (square_long invariant; projection is only
+    // specified for square ROIs).
+    println!(
+        "  px: {:.1} x {:.1} (square_long invariant)",
+        hand_rect.width * fw as f32,
+        hand_rect.height * fh as f32
+    );
+
+    // --- Stage 3: rotated crop (keep_aspect_ratio false = proto default).
+    let mut roi = warp::get_roi(fw, fh, &hand_rect);
+    let padding = warp::pad_roi(224, 224, false, &mut roi);
+    println!("crop roi: {roi:?} padding {padding:?}");
+    let crop = warp::warp_crop(&img_bytes, fw, fh, &roi, 224, (0.0, 1.0));
+    // Save the crop for visual inspection.
+    let mut crop_img = image::RgbImage::new(224, 224);
+    for i in 0..224 * 224 {
+        let v = |c: usize| (crop[i as usize * 3 + c] * 255.0).round().clamp(0.0, 255.0) as u8;
+        crop_img.put_pixel((i % 224) as u32, (i / 224) as u32, image::Rgb([v(0), v(1), v(2)]));
+    }
+    crop_img.save("crop.png")?;
+    println!("wrote crop.png");
+
+    // --- Stage 4: landmark model.
+    let mut lm_session = Session::builder(environment)?.commit_from_file("models/hand_landmark.onnx")?;
+    let crop_tensor = Tensor::from_array(([1i64, 224i64, 224i64, 3i64], crop))?;
+    let lm_outputs = lm_session.run(ort::inputs![crop_tensor])?;
+    let mut collected = Vec::new();
+    for (oname, val) in lm_outputs.iter() {
+        let (shape, data) = val.try_extract_tensor::<f32>()?;
+        collected.push((oname.to_string(), shape.to_vec(), data.to_vec()));
+    }
+    drop(lm_outputs);
+    // Identify by shape + value signature: [1,63] pixel-scale = landmarks;
+    // [1,63] small-scale = world; [1,1] = presence.
+    let mut landmark_raw: Option<Vec<f32>> = None;
+    let mut presence = 0.0f32;
+    for (oname, shape, data) in &collected {
+        let mean_abs = data.iter().map(|v| v.abs()).sum::<f32>() / data.len() as f32;
+        let head: Vec<String> = data.iter().take(3).map(|v| format!("{v:.4}")).collect();
+        println!(
+            "lm out '{oname}' shape {shape:?} mean|v| {mean_abs:.4} head [{}]",
+            head.join(", ")
+        );
+        if data.len() == 63 && mean_abs > 5.0 {
+            landmark_raw = Some(data.clone());
+        }
+        if data.len() == 1 {
+            presence = 1.0 / (1.0 + (-data[0].clamp(-100.0, 100.0)).exp());
+        }
+    }
+    println!("presence (sigmoid): {presence:.4}  (v1 min_detection_confidence gate = 0.5)");
+    let Some(raw) = landmark_raw else {
+        println!("no [1,63] landmark tensor found");
+        return Ok(());
+    };
+
+    // --- Stage 5: decode -> letterbox removal (zeros) -> projection.
+    let mut lms = landmark::decode_landmarks(&raw);
+    landmark::letterbox_remove(&mut lms, padding);
+    let projected = landmark::project_landmarks(&lms, &hand_rect);
+
+    // Landmark bbox + wrist/middle-mcp for ground-truth comparison.
+    let (mut min_x, mut min_y, mut max_x, mut max_y) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for lm in &projected {
+        min_x = min_x.min(lm[0]);
+        max_x = max_x.max(lm[0]);
+        min_y = min_y.min(lm[1]);
+        max_y = max_y.max(lm[1]);
+    }
+    println!(
+        "landmarks: bbox x {min_x:.3}..{max_x:.3} y {min_y:.3}..{max_y:.3}  (v1: x 0.433..0.515 y 0.838..0.981)"
+    );
+    println!(
+        "  wrist ({:.3}, {:.3}) [v1 0.433, 0.838]  middle_mcp ({:.3}, {:.3}) [v1 0.461, 0.911]",
+        projected[0][0], projected[0][1], projected[9][0], projected[9][1]
+    );
+
+    // Dump for numeric comparison against v1_ground_truth.py's JSON.
+    let json: Vec<String> = projected
+        .iter()
+        .map(|lm| format!("[{:.6}, {:.6}, {:.6}]", lm[0], lm[1], lm[2]))
+        .collect();
+    std::fs::write("rust_landmarks.json", format!("[{}]", json.join(",")))?;
+    println!("wrote rust_landmarks.json");
+
+    // Annotate: 21 landmark dots (wrist = red, rest = green) + bbox.
+    let mut out = img.clone();
+    for (i, lm) in projected.iter().enumerate() {
+        let (kx, ky) = ((lm[0] * fw as f32) as i32, (lm[1] * fh as f32) as i32);
+        let color = if i == 0 {
+            image::Rgb([255u8, 0, 0])
+        } else {
+            image::Rgb([0u8, 255, 0])
+        };
+        for dy in -3..=3 {
+            for dx in -3..=3 {
+                if dx * dx + dy * dy <= 9 {
+                    set(&mut out, kx + dx, ky + dy, color);
+                }
+            }
+        }
+    }
+    out.save("frame_landmarks.png")?;
+    println!("wrote frame_landmarks.png");
     Ok(())
 }
 

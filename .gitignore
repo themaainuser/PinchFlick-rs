@@ -3,8 +3,14 @@
 # local camera capture (privacy) and SDD workspace
 frame.png
 frame_detected.png
+frame_landmarks.png
 letterbox_debug.png
+crop.png
 .superpowers/
+
+# parity-gate artifacts (ground-truth dumps + reference test image)
+*_landmarks.json
+test_hand.jpg
 
 # vendored mediapipe v1.1.1 reference sources (M3.1 parity research, re-fetched on demand)
 reference/
