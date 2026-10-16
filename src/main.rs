@@ -23,6 +23,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| "frame.png".into());
     let detect_mode = args.iter().any(|a| a == "--detect");
     let landmarks_mode = args.iter().any(|a| a == "--landmarks");
+    let video_iters: Option<usize> = args.iter().position(|a| a == "--video").map(|i| {
+        args.get(i + 1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3)
+    });
     let img = image::open(&frame_path)?.to_rgb8();
     let (fw, fh) = img.dimensions();
     let fbytes = img.as_raw();
@@ -30,6 +35,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let environment = ort::init().with_name("pinchflick-rs").build()?;
 
+    if video_iters.is_some() {
+        return run_video(&environment, &img, fw, fh, video_iters.unwrap_or(3));
+    }
     if landmarks_mode {
         return run_landmarks(&environment, &img, fw, fh);
     }
@@ -381,6 +389,158 @@ fn run_landmarks(
     }
     out.save("frame_landmarks.png")?;
     println!("wrote frame_landmarks.png");
+    Ok(())
+}
+
+/// M3.4 behavioral gate: stream-mode state machine over N iterations of the
+/// SAME frame — frame 1 detect path, later frames track path (prev
+/// next-frame rect, palm detector skipped), presence gate (raw > 0.6 =
+/// min_detection_confidence) deciding emission + loopback. Dumps
+/// rust_video_landmarks.json = [frame][21][x,y,z] for parity against v1's
+/// VIDEO-mode detect_for_video sequence.
+fn run_video(
+    environment: &Environment,
+    img: &image::RgbImage,
+    fw: u32,
+    fh: u32,
+    iters: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use pinchflick_rs::vision::{decode, image as vimage, landmark, rect, tracking, warp};
+
+    let img_bytes = img.as_raw().clone();
+    let image_size = (fw as f32, fh as f32);
+    let mut det_session = Session::builder(environment)?.commit_from_file("models/palm_detector.onnx")?;
+    let mut lm_session = Session::builder(environment)?.commit_from_file("models/hand_landmark.onnx")?;
+    let anchors = generate_anchors();
+    let mut tracker = tracking::TrackerState::default();
+    let mut frames: Vec<Option<Vec<[f32; 3]>>> = Vec::new();
+
+    for iter in 0..iters {
+        let plan = tracking::plan_frame(
+            &tracker.prev_rects,
+            &[],
+            1,
+            tracking::DEFAULT_MIN_TRACKING_CONFIDENCE,
+        );
+        let hand_rect = if plan.run_detector {
+            // Palm detector on the full frame (M3.2 path), rect via the
+            // M3.3 detection pipeline, associate + clip (base is empty
+            // here because run_detector implies prev < num_hands).
+            let input = vimage::letterbox_normalize(&img_bytes, fw, fh, 192);
+            let tensor = Tensor::from_array(([1i64, 192i64, 192i64, 3i64], input))?;
+            let outputs = det_session.run(ort::inputs![tensor])?;
+            let (boxes, scores) = {
+                let b = outputs["Identity"].try_extract_tensor::<f32>()?;
+                let s = outputs["Identity_1"].try_extract_tensor::<f32>()?;
+                (b.1.to_vec(), s.1.to_vec())
+            };
+            drop(outputs);
+            let mut dets = decode::decode_detections(&boxes, &scores, &anchors, 0.6);
+            dets = decode::weighted_nms(&dets, 0.3);
+            decode::project_detections_to_image(&mut dets, fw, fh, 192);
+            let det_rects: Vec<rect::NormRect> = dets
+                .iter()
+                .map(|d| {
+                    let rotation =
+                        rect::detection_rotation(d.keypoints[0], d.keypoints[2], image_size);
+                    let (x_center, y_center, width, height) =
+                        rect::norm_rect_from_keypoints(&d.keypoints);
+                    rect::transform_rect(
+                        &rect::NormRect {
+                            x_center,
+                            y_center,
+                            width,
+                            height,
+                            rotation,
+                        },
+                        image_size,
+                        rect::DETECT_SCALE,
+                        rect::DETECT_SCALE,
+                        rect::DETECT_SHIFT_X,
+                        rect::DETECT_SHIFT_Y,
+                    )
+                })
+                .collect();
+            let rects = tracking::associate_rects(
+                &tracker.prev_rects,
+                &det_rects,
+                tracking::DEFAULT_MIN_TRACKING_CONFIDENCE,
+            );
+            tracking::clip_rects(rects, 1).into_iter().next()
+        } else {
+            tracker.prev_rects.first().copied()
+        };
+
+        let Some(r) = hand_rect else {
+            println!("frame {iter}: no hand rect (no detection)");
+            tracker.update(vec![]);
+            frames.push(None);
+            continue;
+        };
+        let path = if plan.run_detector { "DETECT" } else { "TRACK " };
+
+        // Crop + landmark model.
+        let mut roi = warp::get_roi(fw, fh, &r);
+        let padding = warp::pad_roi(224, 224, false, &mut roi);
+        let crop = warp::warp_crop(&img_bytes, fw, fh, &roi, 224, (0.0, 1.0));
+        let crop_tensor = Tensor::from_array(([1i64, 224i64, 224i64, 3i64], crop))?;
+        let lm_outputs = lm_session.run(ort::inputs![crop_tensor])?;
+        let mut landmark_raw: Option<Vec<f32>> = None;
+        let mut presence_raw = 0.0f32;
+        for (oname, val) in lm_outputs.iter() {
+            let (_, data) = val.try_extract_tensor::<f32>()?;
+            let mean_abs = data.iter().map(|v| v.abs()).sum::<f32>() / data.len() as f32;
+            if data.len() == 63 && mean_abs > 5.0 {
+                landmark_raw = Some(data.to_vec());
+            }
+            if data.len() == 1 && oname.ends_with("Identity_1") {
+                presence_raw = data[0]; // RAW (TensorsToFloats activation NONE)
+            }
+        }
+        drop(lm_outputs);
+
+        // Presence gate verbatim: raw > min_detection_confidence (0.6).
+        let passed = tracking::presence_gate(presence_raw, 0.6);
+        let emitted = if passed {
+            let raw = landmark_raw.expect("landmark tensor");
+            let mut lms = landmark::decode_landmarks(&raw);
+            landmark::letterbox_remove(&mut lms, padding);
+            let projected = landmark::project_landmarks(&lms, &r);
+            let next = tracking::next_frame_rect(&projected, image_size);
+            println!(
+                "frame {iter}: {path} rect ({:.3}, {:.3}) {:.3}x{:.3} rot {:.3} | presence {presence_raw:.4} PASS | wrist ({:.3}, {:.3}) | next rect ({:.3}, {:.3}) {:.3}x{:.3} rot {:.3}",
+                r.x_center, r.y_center, r.width, r.height, r.rotation,
+                projected[0][0], projected[0][1],
+                next.x_center, next.y_center, next.width, next.height, next.rotation
+            );
+            tracker.update(vec![next]);
+            Some(projected)
+        } else {
+            println!(
+                "frame {iter}: {path} rect ({:.3}, {:.3}) | presence {presence_raw:.4} FAIL -> gated empty -> re-detect next frame",
+                r.x_center, r.y_center
+            );
+            tracker.update(vec![]);
+            None
+        };
+        frames.push(emitted);
+    }
+
+    let json: Vec<String> = frames
+        .iter()
+        .map(|f| match f {
+            Some(lms) => format!(
+                "[{}]",
+                lms.iter()
+                    .map(|lm| format!("[{:.6}, {:.6}, {:.6}]", lm[0], lm[1], lm[2]))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+            None => "null".to_string(),
+        })
+        .collect();
+    std::fs::write("rust_video_landmarks.json", format!("[{}]", json.join(",")))?;
+    println!("wrote rust_video_landmarks.json ({} frames)", frames.len());
     Ok(())
 }
 

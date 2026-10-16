@@ -10,4 +10,5 @@ pub mod decode;
 pub mod image;
 pub mod landmark;
 pub mod rect;
+pub mod tracking;
 pub mod warp;
