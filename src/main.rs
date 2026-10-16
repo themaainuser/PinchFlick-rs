@@ -29,6 +29,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or(3)
     });
     let live_mode = args.iter().any(|a| a == "--live");
+    let dry_run = args.iter().any(|a| a == "--dry-run");
     let config_path = args
         .iter()
         .position(|a| a == "--config")
@@ -43,7 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let environment = ort::init().with_name("pinchflick-rs").build()?;
 
     if live_mode {
-        return run_live(&environment, config_path, camera_override);
+        return run_live(&environment, config_path, camera_override, dry_run);
     }
 
     let img = image::open(&frame_path)?.to_rgb8();
@@ -81,20 +82,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// M3.5 live CLI loop — camera -> Pipeline -> GestureEngine -> console
-/// echo + rolling FPS/stage timings. DRY RUN: actions are printed, not
-/// injected (enigo injection is M3.6). Mirrors v1's controller loop
-/// (controller.py `run()`): mirror before inference, strictly increasing
-/// VIDEO timestamps, YouTubeDetector polled at its interval.
+/// M3.6 live CLI loop — camera -> Pipeline -> GestureEngine -> input
+/// injection (keybd_event/mouse_event, pyautogui-parity). With
+/// `dry_run = true`, actions are printed instead of injected (evidence tool;
+/// `--live --dry-run`). Mirrors v1's controller loop (controller.py `run()`):
+/// mirror before inference, strictly increasing VIDEO timestamps,
+/// YouTubeDetector polled at its interval, pyautogui failsafe gated by
+/// `pyautogui_failsafe`.
 fn run_live(
     environment: &Environment,
     config_path: Option<String>,
     camera_override: Option<i64>,
+    dry_run: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use pinchflick_rs::config;
     use pinchflick_rs::gestures::engine::{GestureEngine, Landmark};
     use pinchflick_rs::gestures::seek::seek_key_sequence;
-    use pinchflick_rs::sys::title::YouTubeDetector;
+    use pinchflick_rs::sys::{input, title::YouTubeDetector};
     use pinchflick_rs::track::{capture::Capture, inference::Pipeline};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -123,7 +127,14 @@ fn run_live(
     )?;
 
     println!();
-    println!("PinchFlick running (CLI dry-run; injection arrives in M3.6).");
+    if dry_run {
+        println!("PinchFlick running (dry-run: actions printed, not injected).");
+    } else {
+        println!("PinchFlick running.");
+        if cfg.pyautogui_failsafe {
+            println!("  failsafe: mouse parked in a screen corner stops PinchFlick");
+        }
+    }
     println!("  scroll : 1 finger = up, 2 fingers = down (works everywhere)");
     println!(
         "  seek   : double-pinch left/right = -/+{}s ({})",
@@ -229,24 +240,64 @@ fn run_live(
         let (on_youtube, _title) = ytd.check(ts, false);
         let res = engine.frame(landmarks.as_deref(), ts, on_youtube);
 
-        // ---- act: scroll (anywhere) — printed only until M3.6 ----
+        // ---- act: scroll (anywhere) ---------------------------------------
         if res.scroll_clicks != 0 {
-            scroll_events += 1;
-            wheel += res.scroll_clicks as i64;
-            println!("[scroll] {:+} clicks (dry-run)", res.scroll_clicks);
+            if dry_run {
+                scroll_events += 1;
+                wheel += res.scroll_clicks as i64;
+                println!("[scroll] {:+} clicks (dry-run)", res.scroll_clicks);
+            } else {
+                // v1: failSafeCheck runs before the wheel event; on failure it
+                // stops without counting the event.
+                if input::failsafe_triggered(cfg.pyautogui_failsafe) {
+                    stop_reason = "pyautogui failsafe (mouse hit a screen corner)";
+                    break 'live;
+                }
+                input::scroll(res.scroll_clicks);
+                scroll_events += 1;
+                wheel += res.scroll_clicks as i64;
+                // real mode is HUD-silent, like v1 (console has no HUD yet).
+            }
         }
 
-        // ---- act: seek (engine already YouTube-gates it) ----
+        // ---- act: seek (engine already YouTube-gates it) -------------------
         if let Some(dir) = res.seek {
             match seek_key_sequence(cfg.seek_seconds, dir.as_str(), &cfg.seek_keys) {
                 Ok(seq) => {
-                    seeks += 1;
                     let arrow = if dir.as_str() == "backward" { "-" } else { "+" };
-                    println!(
-                        "[seek] {arrow}{}s ({}) (dry-run)",
-                        cfg.seek_seconds,
-                        seq.join(" + ")
-                    );
+                    if dry_run {
+                        seeks += 1;
+                        println!(
+                            "[seek] {arrow}{}s ({}) (dry-run)",
+                            cfg.seek_seconds,
+                            seq.join(" + ")
+                        );
+                    } else {
+                        // v1: per key, 50ms gap, failSafeCheck before each
+                        // press; mid-sequence failure stops without stats or
+                        // the [seek] print (keys already sent stay sent).
+                        let mut aborted = false;
+                        for (i, key) in seq.iter().enumerate() {
+                            if i > 0 {
+                                std::thread::sleep(std::time::Duration::from_millis(50));
+                            }
+                            if input::failsafe_triggered(cfg.pyautogui_failsafe) {
+                                stop_reason = "pyautogui failsafe (mouse hit a screen corner)";
+                                aborted = true;
+                                break;
+                            }
+                            input::press(key);
+                        }
+                        if aborted {
+                            break 'live;
+                        }
+                        seeks += 1;
+                        println!(
+                            "[seek] {arrow}{}s ({})",
+                            cfg.seek_seconds,
+                            seq.join(" + ")
+                        );
+                    }
                 }
                 Err(e) => println!("[seek error] {e}"),
             }
@@ -254,8 +305,12 @@ fn run_live(
         if let Some(blocked) = &res.seek_blocked {
             println!("[seek blocked] {blocked}");
         }
-        if res.tap.is_some() && res.seek.is_none() {
-            println!("[tap] {} - double-pinch again to seek", res.tap_status);
+        if let Some(side) = res.tap && res.seek.is_none() {
+            println!(
+                "[tap] {} side -- double-pinch again within {}ms",
+                side.as_str(),
+                cfg.double_tap_window_ms
+            );
         }
 
         if win_start.elapsed().as_secs_f64() >= 2.0 {
@@ -302,12 +357,21 @@ fn run_live(
         }
     }
 
-    let total = t0.elapsed().as_secs_f64();
+    let elapsed = t0.elapsed().as_secs_f64().max(1e-6);
     println!();
     println!("Stopped: {stop_reason}");
     println!(
-        "  frames {frames} ({:.1} fps avg) | hand {hand_frames} | seeks {seeks} | scroll events {scroll_events} | wheel {wheel:+}",
-        if total > 0.0 { frames as f64 / total } else { 0.0 }
+        "Summary: {frames} frames in {elapsed:.1}s ({:.1} fps), hand visible {hand_frames}/{frames}, seeks fired {seeks}, scroll events {scroll_events} ({wheel:+} wheel clicks)",
+        frames as f64 / elapsed
+    );
+    println!(
+        "Last focused window: {} -> YouTube: {}",
+        if ytd.title.is_empty() {
+            "(none)"
+        } else {
+            ytd.title.as_str()
+        },
+        if ytd.is_youtube { "yes" } else { "no" }
     );
     Ok(())
 }

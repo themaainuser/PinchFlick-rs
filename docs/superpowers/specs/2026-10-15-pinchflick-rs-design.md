@@ -55,7 +55,7 @@ possible donation of improvements (config schema, gesture math) back to v1.
   that is an acceptable outcome.
 - No mouse/cursor control (the old `gesture_mouse_drag.py` idea stays out).
 - No multi-hand, no new gestures, no gesture editor UI.
-- Windows 10/11 first. Portability is welcome where free (nokhwa/enigo are
+- Windows 10/11 first. Portability is welcome where free (nokhwa is
   cross-platform) but never at the cost of the schedule.
 - Anti-goals: no Python anywhere in the runtime path; no build-time C++
   toolchain, vcpkg, or system OpenCV (that dependency class is the enemy);
@@ -84,7 +84,7 @@ possible donation of improvements (config schema, gesture math) back to v1.
 | NN inference | **tract** (pure-Rust TFLite), both models from the `.task` zip. Tracking policy mirrors MediaPipe's VIDEO mode: detector on the first frame and again whenever landmarks are lost or low-confidence; landmark model on the tracked ROI every frame | Zero DLLs, static binary. **M0 gate:** if tract fails on either model's ops, fall back to **ort** (ONNX Runtime bindings) + community ONNX conversions — accepted cost: ~15–20 MB of runtime DLLs |
 | Landmark math / gestures | Straight port of `gesture_core.py` (PinchState hysteresis, DoubleTapSeeker, ScrollDriver, dead-zone, YouTubeDetector suffix rule) | It is dependency-free Python; semantics are already test-proven; port test-by-test |
 | Preview window + HUD | **eframe/egui**, viewport flag `always_on_top`, ~480×360 window placed top-right, resized/scaled render | Immediate-mode HUD (flash, status, divider) is trivial; fallback: `minifb` (worse text) or no preview at all (CLI-only mode stays useful, see M3) |
-| Input injection | **enigo** (SendInput under the hood): wheel scroll + `j`/`l`/arrow keypresses to the focused window | Same OS mechanism pyautogui uses, so focus semantics are identical |
+| Input injection | **windows-rs direct `keybd_event`/`mouse_event`** — the exact legacy Win32 calls pyautogui itself makes: wheel scroll + `j`/`l`/arrow keypresses to the focused window | Byte-parity by construction. **M3.6 amendment:** enigo was dropped after source review — its wheel path sends −length×120 (sign-flipped and 120× vs pyautogui's raw `dwData=clicks`), `Key::Unicode('L')` maps to an invalid VK (silent no-op breaking shift-char parity), and its EVENT_MARKER/EXTENDEDKEY usage diverges. Same calls ⇒ same focus semantics |
 | Window title read | **windows** crate: `GetForegroundWindow` + `GetWindowTextW`, polled every 200 ms (config `youtube_check_interval_ms`) | Same rule as v1, incl. rstrip + casefold + browser-suffix tolerance |
 | Config | `serde_json`, identical 32-key schema + identical validation messages; default file = `config.json` next to the exe (`--config <path>` overrides) | Schema is shared with v1; each app defaults to the file beside itself — point `--config` at one file to truly share |
 | Logging | `println!` status lines + `env_logger` behind `--debug` | v1 parity |
@@ -104,7 +104,7 @@ src/
     inference.rs     tract (or ort) session, both models, frame -> 21 landmarks
   sys/
     title.rs         foreground window title + YouTubeDetector
-    input.rs         enigo wheel/keys
+    input.rs         keybd_event/mouse_event (wheel + keys, pyautogui-parity)
     ui.rs            egui overlay window, flash, HUD
 tests/
     parity.rs        the 25 v1 selftests, same scenarios
@@ -127,7 +127,7 @@ tests/
   ort+ONNX; (4) never silently drop a goal — final numbers land in the
   README either way.
 - **M2 — gesture engine port.** All 25 parity tests green in `cargo test`.
-- **M3 — the tool is real.** enigo injection + window-title gating: scroll
+- **M3 — the tool is real.** input injection + window-title gating: scroll
   and seek work CLI-only (no preview yet). Gate: a human double-pinches and
   YouTube actually seeks; scroll works in a browser + a game.
 - **M4 — preview/HUD.** egui window, divider, flashes, debug overlay,
@@ -142,7 +142,7 @@ tests/
 | tract can't run the tflite graph | medium | M0 exists to find out on day one; ort+ONNX fallback pre-designed (costs DLLs, still ≪ 350 MB) |
 | nokhwa flaky with the author's specific webcam | low-medium | Proven in M1; fallback capture backends behind one trait |
 | egui always-on-top/DPI quirks over fullscreen video | medium | v1 solved the same problem with raw Win32 habits; test over YouTube fullscreen early in M4 |
-| enigo focus/send semantics differ from pyautogui | low | Both are SendInput; M3 human test is the gate |
+| injection semantics differ from pyautogui (per-keypress ordering, failsafe corners) | low | We now call the identical `keybd_event`/`mouse_event` APIs pyautogui calls, with the modifier dance + failsafe predicate ported verbatim; M3 human test is the gate |
 | One model conversion licensing/quality issue (ONNX path) | low | Model card says Apache-2.0; verify bundled LICENSE |
 | Effort overrun / motivation loss | high (it's a side project!) | M3 (usable CLI-only tool) is deliberately early; abandoning after any milestone leaves a working v1 untouched |
 
@@ -227,7 +227,7 @@ Consequences:
   whose Windows SDK had been silently skipped — blocked every repair until
   it was uninstalled and reinstalled clean with VCTools + Win11SDK 26100.
 
-## 13. M1 results (2026-10-15) � ort route PASSES
+## 13. M1 results (2026-10-15) � ort route PASSES
 
 Models: `takoyakisoft/vtuberkit-vision-landmarkers-onnx` (converted from the
 official MediaPipe `.task` bundles; SHA256 verified against the model card).
@@ -237,9 +237,9 @@ Runtime: `ort` 2.0.0-rc.14 + onnxruntime, CPU, this machine.
 |---|---|---|---|---|
 | palm_detector | [1,192,192,3] | [1,2016,18] anchors, [1,2016,1] scores | **5.67 ms** | 4.92 ms |
 | hand_landmark | [1,224,224,3] | [1,63] landmarks, [1,1] flag, [1,1] score, [1,63] world | **3.82 ms** | 3.17 ms |
-| hand_recrop | [1,256,256,3] | [1,1,1,4] bbox | (metadata probe only) | � |
+| hand_recrop | [1,256,256,3] | [1,1,1,4] bbox | (metadata probe only) | � |
 
-Combined ~**9.5 ms/frame** on CPU � inside the 15 ms budget with headroom
+Combined ~**9.5 ms/frame** on CPU � inside the 15 ms budget with headroom
 for the detect-every-N tracking policy. **M1 gate: PASS.** Sanity: a
 no-hand center crop scored flag=0.0017 (correct rejection); session loads
 take ~35 ms each, once at startup. onnxruntime DLL size measured at M5.
