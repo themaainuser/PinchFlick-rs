@@ -112,24 +112,23 @@ impl Pipeline {
         let crop = warp::warp_crop(rgb, fw, fh, &roi, 224, (0.0, 1.0));
         let crop_tensor = Tensor::from_array(([1i64, 224, 224, 3], crop))?;
         let lm_outputs = self.lm_session.run(ort::inputs![crop_tensor])?;
-        let mut landmark_raw: Option<Vec<f32>> = None;
-        let mut presence_raw = 0.0f32;
-        for (oname, val) in lm_outputs.iter() {
-            let (_, data) = val.try_extract_tensor::<f32>()?;
-            let mean_abs = data.iter().map(|v| v.abs()).sum::<f32>() / data.len() as f32;
-            if data.len() == 63 && mean_abs > 5.0 {
-                landmark_raw = Some(data.to_vec());
-            }
-            if data.len() == 1 && oname.ends_with("Identity_1") {
-                presence_raw = data[0];
-            }
-        }
+        // Output names pinned at M3.3, same name-pinning as the detector
+        // below: Identity = [1,63] 224-px landmarks, Identity_1 = [1,1]
+        // presence flag (raw, activation NONE), Identity_2 = handedness
+        // score, Identity_3 = [1,63] world landmarks.
+        let landmark_raw = {
+            let (_, data) = lm_outputs["Identity"].try_extract_tensor::<f32>()?;
+            data.to_vec()
+        };
+        let presence_raw = {
+            let (_, data) = lm_outputs["Identity_1"].try_extract_tensor::<f32>()?;
+            data[0]
+        };
         drop(lm_outputs);
 
         let passed = tracking::presence_gate(presence_raw, self.presence_threshold);
         let landmarks = if passed {
-            let raw = landmark_raw.ok_or("landmark tensor [1,63] not found")?;
-            let mut lms = landmark::decode_landmarks(&raw);
+            let mut lms = landmark::decode_landmarks(&landmark_raw);
             landmark::letterbox_remove(&mut lms, padding);
             let projected = landmark::project_landmarks(&lms, &r);
             let next = tracking::next_frame_rect(&projected, image_size);
