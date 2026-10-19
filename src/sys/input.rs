@@ -318,6 +318,16 @@ pub fn scroll(clicks: i32) {
     unsafe { mouse_event(MOUSEEVENTF_WHEEL, pt.x, pt.y, wheel_mouse_data(clicks), 0) };
 }
 
+/// Primary-monitor size in physical pixels, via the same
+/// `GetSystemMetrics(SM_CXSCREEN/CYSCREEN)` pair pyautogui uses to build its
+/// failsafe points — feeds `hud::window_position` for v1's top-right HUD
+/// placement (controller.py:144-146).
+pub fn screen_size() -> (i32, i32) {
+    let w = unsafe { GetSystemMetrics(SM_CXSCREEN) };
+    let h = unsafe { GetSystemMetrics(SM_CYSCREEN) };
+    (w, h)
+}
+
 /// pyautogui `failSafeCheck`: raise (= stop) when the cursor sits in any of
 /// the four screen corners and `pyautogui_failsafe` is enabled. When
 /// GetCursorPos fails, pt stays (0, 0) — a corner — which matches v1, where a

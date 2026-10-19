@@ -11,6 +11,10 @@ edition = "2024"
 nokhwa-bindings-windows = { path = "third_party/nokhwa-bindings-windows" }
 
 [dependencies]
+# M4: the preview/HUD window (design doc section 5). 0.37 = current stable
+# (published 2026-10-15); run_native/ViewportBuilder/Painter APIs verified
+# against docs.rs 0.37 before wiring.
+eframe = "0.37"
 image = "0.25.10"
 nokhwa = { version = "0.10.11", features = ["input-msmf"] }
 ort = "2.0.0-rc.14"

@@ -9,10 +9,18 @@
 mod spike;
 
 use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use ort::environment::Environment;
 use ort::session::Session;
 use ort::value::Tensor;
 use pinchflick_rs::vision::{anchors::generate_anchors, decode};
+use pinchflick_rs::config;
+use pinchflick_rs::gestures::engine::{GestureEngine, Landmark};
+use pinchflick_rs::gestures::seek::{seek_key_sequence, Side};
+use pinchflick_rs::sys::{hud, input, title::YouTubeDetector};
+use pinchflick_rs::track::{capture::Capture, inference::Pipeline};
+use eframe::egui;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -82,70 +90,633 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// M3.6 live CLI loop — camera -> Pipeline -> GestureEngine -> input
-/// injection (keybd_event/mouse_event, pyautogui-parity). With
-/// `dry_run = true`, actions are printed instead of injected (evidence tool;
-/// `--live --dry-run`). Mirrors v1's controller loop (controller.py `run()`):
-/// mirror before inference, strictly increasing VIDEO timestamps,
-/// YouTubeDetector polled at its interval, pyautogui failsafe gated by
-/// `pyautogui_failsafe`.
+/// M4.3 — egui preview HUD wiring (declared spike: the eframe/camera/
+/// injection plumbing is compiler- and human-gated, not unit-tested; the
+/// pure pieces it composes — `HudState`, `Scaler`, string builders,
+/// skeleton projection — live in `sys/hud.rs` with 27 passing tests).
+///
+/// The loop body is M3.6's `'live` iteration moved into [`Live::step`]
+/// (console prints kept verbatim: dry-run evidence, `[stats]`, `[seek]`).
+/// eframe drives it: `logic()` = keys + one step + repaint, `ui()` = paint.
+struct Live {
+    cfg: config::Config,
+    engine: GestureEngine,
+    ytd: YouTubeDetector,
+    capture: Capture,
+    pipeline: Pipeline,
+    hud: hud::HudState,
+    t0: Instant,
+    last_ts: i64,
+    // v1's stats dict.
+    frames: u64,
+    hand_frames: u64,
+    seeks: u64,
+    scroll_events: u64,
+    wheel: i64,
+    // Rolling 2 s window for the stage report.
+    win_start: Instant,
+    win_frames: u64,
+    win_wait_ms: f64,
+    win_decode_ms: f64,
+    win_hand: u64,
+    win_detects: u64,
+    win_detect_ms: f64,
+    win_landmark_ms: f64,
+    win_landmark_n: u64,
+    // Current frame's draw data, copied out under the lock for `ui()`.
+    status: String,
+    tap_status: String,
+    pinched: bool,
+    ratio: Option<f64>,
+    on_youtube: bool,
+    scroll_clicks: i32,
+    landmarks: Vec<Landmark>,
+    frame_w: f32,
+    frame_h: f32,
+}
+
+/// What one `step()` says about the loop's future.
+enum StepOutcome {
+    Continue,
+    Stop(String),
+}
+
+impl Live {
+    /// M3.6 setup verbatim (config, engine, detector, capture, pipeline).
+    fn new(
+        environment: &Environment,
+        config_path: Option<String>,
+        camera_override: Option<i64>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut cfg = config::load_config(config_path.as_deref())?;
+        if let Some(idx) = camera_override {
+            cfg.camera_index = idx;
+        }
+
+        let engine = GestureEngine::new(&cfg, cfg.mirror_display);
+        let ytd = YouTubeDetector::new(
+            cfg.youtube_title_markers.clone(),
+            cfg.youtube_check_interval_ms,
+        );
+        let capture = Capture::open(
+            cfg.camera_index,
+            cfg.frame_width,
+            cfg.frame_height,
+            cfg.mirror_display,
+        )
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        let pipeline = Pipeline::new(
+            environment,
+            cfg.min_detection_confidence,
+            cfg.min_tracking_confidence,
+        )?;
+
+        Ok(Self {
+            hud: hud::HudState::new(cfg.show_debug_window),
+            frame_w: cfg.frame_width as f32,
+            frame_h: cfg.frame_height as f32,
+            t0: Instant::now(),
+            last_ts: -1,
+            frames: 0,
+            hand_frames: 0,
+            seeks: 0,
+            scroll_events: 0,
+            wheel: 0,
+            win_start: Instant::now(),
+            win_frames: 0,
+            win_wait_ms: 0.0,
+            win_decode_ms: 0.0,
+            win_hand: 0,
+            win_detects: 0,
+            win_detect_ms: 0.0,
+            win_landmark_ms: 0.0,
+            win_landmark_n: 0,
+            status: String::new(),
+            tap_status: String::new(),
+            pinched: false,
+            ratio: None,
+            on_youtube: false,
+            scroll_clicks: 0,
+            landmarks: Vec::new(),
+            cfg,
+            engine,
+            ytd,
+            capture,
+            pipeline,
+        })
+    }
+
+    /// One camera -> pipeline -> engine -> act iteration (M3.6 loop body).
+    /// Console output is identical to M3.6; the HUD visuals come from the
+    /// state written here, painted by [`HudApp::ui`].
+    fn step(&mut self, dry_run: bool) -> StepOutcome {
+        self.hud.update_fps(self.t0.elapsed().as_secs_f64());
+
+        let (rgb, w, h) = match self.capture.capture() {
+            Ok(v) => v,
+            Err(e) => {
+                println!("[capture error] {e}");
+                return StepOutcome::Stop("camera stopped delivering frames".to_string());
+            }
+        };
+
+        let mut ts = self.t0.elapsed().as_millis() as i64;
+        if ts <= self.last_ts {
+            ts = self.last_ts + 1; // VIDEO mode demands strictly increasing stamps
+        }
+        self.last_ts = ts;
+
+        let out = match self.pipeline.process(&rgb, w, h) {
+            Ok(o) => o,
+            Err(e) => {
+                println!("[pipeline error] {e}");
+                return StepOutcome::Stop("inference error".to_string());
+            }
+        };
+        self.frames += 1;
+        self.win_frames += 1;
+        self.win_wait_ms += self.capture.last_wait_ms;
+        self.win_decode_ms += self.capture.last_decode_ms;
+        if out.landmarks.is_some() {
+            self.hand_frames += 1;
+            self.win_hand += 1;
+        }
+        if !out.detect_ms.is_zero() {
+            self.win_detects += 1;
+            self.win_detect_ms += out.detect_ms.as_secs_f64() * 1e3;
+        }
+        if !out.landmark_ms.is_zero() {
+            self.win_landmark_n += 1;
+            self.win_landmark_ms += out.landmark_ms.as_secs_f64() * 1e3;
+        }
+
+        let landmarks = out.landmarks.as_ref().map(|lms| {
+            lms.iter()
+                .map(|l| Landmark::new(l[0] as f64, l[1] as f64))
+                .collect::<Vec<_>>()
+        });
+        let (on_youtube, _title) = self.ytd.check(ts, false);
+        let res = self.engine.frame(landmarks.as_deref(), ts, on_youtube);
+
+        // ---- HUD state + draw data for this frame -------------------------
+        self.hud
+            .on_engine_result(&res, ts, self.cfg.seek_seconds);
+        self.status = hud::status_line(on_youtube, &res);
+        self.tap_status = res.tap_status.clone();
+        self.on_youtube = on_youtube;
+        self.ratio = res.ratio;
+        self.pinched = res.pinched;
+        self.scroll_clicks = res.scroll_clicks;
+        self.frame_w = w as f32;
+        self.frame_h = h as f32;
+        self.landmarks = landmarks.unwrap_or_default();
+
+        // ---- act: scroll (anywhere) ---------------------------------------
+        if res.scroll_clicks != 0 {
+            if dry_run {
+                self.scroll_events += 1;
+                self.wheel += res.scroll_clicks as i64;
+                println!("[scroll] {:+} clicks (dry-run)", res.scroll_clicks);
+            } else {
+                // v1: failSafeCheck runs before the wheel event; on failure it
+                // stops without counting the event.
+                if input::failsafe_triggered(self.cfg.pyautogui_failsafe) {
+                    return StepOutcome::Stop(
+                        "pyautogui failsafe (mouse hit a screen corner)".to_string(),
+                    );
+                }
+                input::scroll(res.scroll_clicks);
+                self.scroll_events += 1;
+                self.wheel += res.scroll_clicks as i64;
+                // real mode is HUD-silent — the HUD now carries the visuals.
+            }
+        }
+
+        // ---- act: seek (engine already YouTube-gates it) -------------------
+        if let Some(dir) = res.seek {
+            match seek_key_sequence(self.cfg.seek_seconds, dir.as_str(), &self.cfg.seek_keys) {
+                Ok(seq) => {
+                    let arrow = if dir.as_str() == "backward" { "-" } else { "+" };
+                    if dry_run {
+                        self.seeks += 1;
+                        println!(
+                            "[seek] {arrow}{}s ({}) (dry-run)",
+                            self.cfg.seek_seconds,
+                            seq.join(" + ")
+                        );
+                    } else {
+                        // v1: per key, 50ms gap, failSafeCheck before each
+                        // press; mid-sequence failure stops without stats or
+                        // the [seek] print (keys already sent stay sent).
+                        let mut aborted = false;
+                        for (i, key) in seq.iter().enumerate() {
+                            if i > 0 {
+                                std::thread::sleep(std::time::Duration::from_millis(50));
+                            }
+                            if input::failsafe_triggered(self.cfg.pyautogui_failsafe) {
+                                aborted = true;
+                                break;
+                            }
+                            input::press(key);
+                        }
+                        if aborted {
+                            return StepOutcome::Stop(
+                                "pyautogui failsafe (mouse hit a screen corner)".to_string(),
+                            );
+                        }
+                        self.seeks += 1;
+                        println!(
+                            "[seek] {arrow}{}s ({})",
+                            self.cfg.seek_seconds,
+                            seq.join(" + ")
+                        );
+                    }
+                }
+                Err(e) => println!("[seek error] {e}"),
+            }
+        }
+        if let Some(blocked) = &res.seek_blocked {
+            println!("[seek blocked] {blocked}");
+        }
+        if let Some(side) = res.tap && res.seek.is_none() {
+            println!(
+                "[tap] {} side -- double-pinch again within {}ms",
+                side.as_str(),
+                self.cfg.double_tap_window_ms
+            );
+        }
+
+        if self.win_start.elapsed().as_secs_f64() >= 2.0 {
+            let secs = self.win_start.elapsed().as_secs_f64();
+            let fps = self.win_frames as f64 / secs;
+            let det_avg = if self.win_detects > 0 {
+                self.win_detect_ms / self.win_detects as f64
+            } else {
+                0.0
+            };
+            let lmk_avg = if self.win_landmark_n > 0 {
+                self.win_landmark_ms / self.win_landmark_n as f64
+            } else {
+                0.0
+            };
+            let wait_avg = if self.win_frames > 0 {
+                self.win_wait_ms / self.win_frames as f64
+            } else {
+                0.0
+            };
+            let decode_avg = if self.win_frames > 0 {
+                self.win_decode_ms / self.win_frames as f64
+            } else {
+                0.0
+            };
+            println!(
+                "[stats] {fps:.1} fps | hand {}% | wait {wait_avg:.1}ms | decode {decode_avg:.1}ms | detect {det_avg:.1}ms ({} runs) | landmark {lmk_avg:.1}ms | total {}",
+                if self.win_frames > 0 {
+                    self.win_hand * 100 / self.win_frames
+                } else {
+                    0
+                },
+                self.win_detects,
+                self.frames
+            );
+            self.win_start = Instant::now();
+            self.win_frames = 0;
+            self.win_wait_ms = 0.0;
+            self.win_decode_ms = 0.0;
+            self.win_hand = 0;
+            self.win_detects = 0;
+            self.win_detect_ms = 0.0;
+            self.win_landmark_ms = 0.0;
+            self.win_landmark_n = 0;
+        }
+
+        StepOutcome::Continue
+    }
+
+    /// v1's per-frame window title (controller.py:281-282).
+    fn short_title(&self) -> String {
+        hud::short_title(
+            self.on_youtube,
+            self.ratio,
+            self.scroll_clicks,
+            self.seeks,
+        )
+    }
+}
+
+/// Everything `ui()` paints for the current frame, snapshotted by `logic()`
+/// while the [`Live`] lock is held (v1 draws straight from the same locals).
+#[derive(Default)]
+struct PaintFrame {
+    status: String,
+    tap_status: String,
+    block: Option<String>,
+    debug: Option<String>,
+    flash: Option<hud::Flash>,
+    points: Vec<(f32, f32)>,
+    pinched: bool,
+    frame_w: f32,
+    frame_h: f32,
+}
+
+/// The eframe app: `logic()` = v1's waitKey branch + one loop iteration,
+/// `ui()` = v1's draw section (controller.py:255-279) in egui.
+struct HudApp {
+    live: Arc<Mutex<Live>>,
+    quit: Arc<AtomicBool>,
+    out: Arc<Mutex<Option<String>>>,
+    dry_run: bool,
+    paint: PaintFrame,
+    stop: Option<String>,
+    finished: bool,
+    last_title: String,
+}
+
+impl eframe::App for HudApp {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // v1's waitKey branch (controller.py:289-293): q/ESC quit, d toggles.
+        if ctx.input(|i| i.key_pressed(egui::Key::Q) || i.key_pressed(egui::Key::Escape)) {
+            self.quit.store(true, Ordering::SeqCst);
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::D)) {
+            self.live.lock().unwrap().hud.toggle_debug();
+        }
+        let window_closed = ctx.input(|i| i.viewport().close_requested());
+        if window_closed {
+            self.quit.store(true, Ordering::SeqCst);
+        }
+
+        if self.stop.is_none() && !self.quit.load(Ordering::SeqCst) {
+            let mut live = self.live.lock().unwrap();
+            if let StepOutcome::Stop(reason) = live.step(self.dry_run) {
+                self.stop = Some(reason);
+            }
+            // Snapshot what ui() paints, all under this one lock.
+            let ts = live.t0.elapsed().as_millis() as i64;
+            let p = &mut self.paint;
+            p.status.clone_from(&live.status);
+            p.tap_status.clone_from(&live.tap_status);
+            p.block = live.hud.block_text_at(ts).map(str::to_string);
+            p.debug = live
+                .hud
+                .show_debug
+                .then(|| hud::debug_line(live.hud.fps, live.scroll_clicks, live.seeks, &live.ytd.title));
+            p.flash = live.hud.flash_at(ts).cloned();
+            p.pinched = live.pinched;
+            p.frame_w = live.frame_w;
+            p.frame_h = live.frame_h;
+            p.points =
+                hud::skeleton_points(&live.landmarks, live.frame_w as u32, live.frame_h as u32);
+            let title = live.short_title();
+            if title != self.last_title {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+                self.last_title = title;
+            }
+        }
+
+        if self.stop.is_none() && self.quit.load(Ordering::SeqCst) {
+            // stop-reason wording diverges from v1 on purpose (deferred, M3.6):
+            // v1 says "quit key"; we keep "quit (q)" and say "(window closed)"
+            // only for the ✕ button.
+            self.stop = Some(if window_closed {
+                "quit (window closed)"
+            } else {
+                "quit (q)"
+            }
+            .to_string());
+        }
+
+        if let Some(reason) = &self.stop {
+            if !self.finished {
+                {
+                    let live = self.live.lock().unwrap();
+                    park_summary(&live, reason, &self.out);
+                }
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                self.finished = true;
+            }
+        }
+
+        // Camera cadence drives the loop (each step blocks on the capture).
+        ctx.request_repaint();
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let rect = ui.max_rect();
+        let p = &self.paint;
+        // v1 draws on the 640x480 frame and lets cv2.imshow stretch it to the
+        // window exactly (aspect ignored) — axes scale independently.
+        let sc = hud::Scaler::new(p.frame_w, p.frame_h, rect.width(), rect.height());
+        let painter = ui.painter();
+        let at = |pt: (f32, f32)| -> egui::Pos2 {
+            let (x, y) = sc.pt(pt);
+            egui::pos2(rect.left() + x, rect.top() + y)
+        };
+
+        painter.rect_filled(rect, 0.0, egui::Color32::BLACK);
+
+        // Center divider (v1 controller.py:256).
+        let mid = at((p.frame_w / 2.0, 0.0));
+        painter.line_segment(
+            [
+                egui::pos2(mid.x, rect.top()),
+                egui::pos2(mid.x, rect.bottom()),
+            ],
+            egui::Stroke::new((sc.sx + sc.sy) / 2.0, rgb(hud::DIVIDER_RGB)),
+        );
+
+        // Hand skeleton (v1 draw_hand, controller.py:79-86): lines thickness
+        // 2, dots radius 3, red while pinched.
+        let hand = rgb(if p.pinched {
+            hud::HAND_PINCHED_RGB
+        } else {
+            hud::HAND_OPEN_RGB
+        });
+        for &(a, b) in hud::HAND_CONNECTIONS.iter() {
+            if let (Some(pa), Some(pb)) = (p.points.get(a), p.points.get(b)) {
+                painter.line_segment([at(*pa), at(*pb)], egui::Stroke::new(sc.sx + sc.sy, hand));
+            }
+        }
+        for pt in &p.points {
+            painter.circle_filled(at(*pt), 3.0 * (sc.sx + sc.sy) / 2.0, hand);
+        }
+
+        // Status lines (v1 controller.py:259-269): x=10, baselines y=26,
+        // 52, 78, 104; frame-space font 14.
+        let fs = 14.0 * sc.sx;
+        let line = |y: f32| egui::pos2(rect.left() + 10.0 * sc.sx, rect.top() + y * sc.sy);
+        halo_text(
+            &painter,
+            &p.status,
+            line(26.0),
+            egui::Align2::LEFT_BOTTOM,
+            fs,
+            rgb(hud::STATUS_TEXT_RGB),
+            sc.sx,
+        );
+        halo_text(
+            &painter,
+            &p.tap_status,
+            line(52.0),
+            egui::Align2::LEFT_BOTTOM,
+            fs,
+            rgb(hud::TAP_STATUS_TEXT_RGB),
+            sc.sx,
+        );
+        if let Some(block) = &p.block {
+            halo_text(
+                &painter,
+                block,
+                line(78.0),
+                egui::Align2::LEFT_BOTTOM,
+                fs,
+                rgb(hud::BLOCK_TEXT_RGB),
+                sc.sx,
+            );
+        }
+        if let Some(debug) = &p.debug {
+            halo_text(
+                &painter,
+                debug,
+                line(104.0),
+                egui::Align2::LEFT_BOTTOM,
+                fs,
+                rgb(hud::DEBUG_TEXT_RGB),
+                sc.sx,
+            );
+        }
+
+        // Side flash (v1 controller.py:270-279): frame-space font 26 at mid
+        // height; left flush at x=14, right flush at the right edge - 14.
+        if let Some(f) = &p.flash {
+            let y = rect.top() + (p.frame_h / 2.0) * sc.sy;
+            let (pos, anchor) = match f.side {
+                Side::Left => (
+                    egui::pos2(rect.left() + 14.0 * sc.sx, y),
+                    egui::Align2::LEFT_BOTTOM,
+                ),
+                Side::Right => (
+                    egui::pos2(rect.right() - 14.0 * sc.sx, y),
+                    egui::Align2::RIGHT_BOTTOM,
+                ),
+            };
+            halo_text(
+                &painter,
+                &f.text,
+                pos,
+                anchor,
+                26.0 * sc.sx,
+                rgb(f.color),
+                1.5 * sc.sx,
+            );
+        }
+    }
+}
+
+/// v1's `_put` (controller.py:72-76): a black outline pass behind the
+/// colored pass. egui 0.37 has no text-stroke API (ruled at M4.3), so the
+/// outline is eight offset black copies — same readability, same two-pass
+/// visual. Offsets are in window points (frame px * scale).
+fn halo_text(
+    painter: &egui::Painter,
+    text: &str,
+    pos: egui::Pos2,
+    anchor: egui::Align2,
+    size: f32,
+    color: egui::Color32,
+    outline: f32,
+) {
+    if text.is_empty() {
+        return;
+    }
+    let font = egui::FontId::proportional(size);
+    for &(dx, dy) in &[
+        (0.0, -outline),
+        (0.0, outline),
+        (-outline, 0.0),
+        (outline, 0.0),
+        (-outline, -outline),
+        (outline, -outline),
+        (-outline, outline),
+        (outline, outline),
+    ] {
+        painter.text(
+            pos + egui::vec2(dx, dy),
+            anchor,
+            text,
+            font.clone(),
+            egui::Color32::BLACK,
+        );
+    }
+    painter.text(pos, anchor, text, font, color);
+}
+
+/// hud::Rgb -> egui color.
+fn rgb(c: hud::Rgb) -> egui::Color32 {
+    egui::Color32::from_rgb(c.0, c.1, c.2)
+}
+
+/// The old console loop's exit block (M3.6 / v1 controller.py:303-310),
+/// parked as text: `run_native` consumes the app, so the summary is read
+/// back out after the window closes.
+fn park_summary(live: &Live, stop_reason: &str, out: &Arc<Mutex<Option<String>>>) {
+    let elapsed = live.t0.elapsed().as_secs_f64().max(1e-6);
+    let text = format!(
+        "\nStopped: {stop_reason}\nSummary: {} frames in {elapsed:.1}s ({:.1} fps), hand visible {}/{}, seeks fired {}, scroll events {} ({:+} wheel clicks)\nLast focused window: {} -> YouTube: {}\n",
+        live.frames,
+        live.frames as f64 / elapsed,
+        live.hand_frames,
+        live.frames,
+        live.seeks,
+        live.scroll_events,
+        live.wheel,
+        if live.ytd.title.is_empty() {
+            "(none)"
+        } else {
+            live.ytd.title.as_str()
+        },
+        if live.ytd.is_youtube { "yes" } else { "no" },
+    );
+    *out.lock().unwrap() = Some(text);
+}
+
+/// M3.6 live entry point — same signature, now with the always-on-top
+/// preview window (v1's cv2.imshow replacement). The console banner,
+/// stats and summary are unchanged; `d`/`q`/ESC live in the window
+/// (v1 controller.py:156), and the stdin `q` thread still works.
 fn run_live(
     environment: &Environment,
     config_path: Option<String>,
     camera_override: Option<i64>,
     dry_run: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use pinchflick_rs::config;
-    use pinchflick_rs::gestures::engine::{GestureEngine, Landmark};
-    use pinchflick_rs::gestures::seek::seek_key_sequence;
-    use pinchflick_rs::sys::{input, title::YouTubeDetector};
-    use pinchflick_rs::track::{capture::Capture, inference::Pipeline};
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
-
-    let mut cfg = config::load_config(config_path.as_deref())?;
-    if let Some(idx) = camera_override {
-        cfg.camera_index = idx;
-    }
-
-    let mut engine = GestureEngine::new(&cfg, cfg.mirror_display);
-    let mut ytd = YouTubeDetector::new(
-        cfg.youtube_title_markers.clone(),
-        cfg.youtube_check_interval_ms,
-    );
-    let mut capture = Capture::open(
-        cfg.camera_index,
-        cfg.frame_width,
-        cfg.frame_height,
-        cfg.mirror_display,
-    )
-    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-    let mut pipeline = Pipeline::new(
-        environment,
-        cfg.min_detection_confidence,
-        cfg.min_tracking_confidence,
-    )?;
+    let live = Live::new(environment, config_path, camera_override)?;
+    let always_on_top = live.cfg.always_on_top;
+    let (frame_w, frame_h) = (live.frame_w, live.frame_h);
+    let seek_seconds = live.cfg.seek_seconds;
+    let seek_requires_youtube = live.cfg.seek_requires_youtube;
+    let pyautogui_failsafe = live.cfg.pyautogui_failsafe;
 
     println!();
     if dry_run {
         println!("PinchFlick running (dry-run: actions printed, not injected).");
     } else {
         println!("PinchFlick running.");
-        if cfg.pyautogui_failsafe {
+        if pyautogui_failsafe {
             println!("  failsafe: mouse parked in a screen corner stops PinchFlick");
         }
     }
     println!("  scroll : 1 finger = up, 2 fingers = down (works everywhere)");
     println!(
         "  seek   : double-pinch left/right = -/+{}s ({})",
-        cfg.seek_seconds,
-        if cfg.seek_requires_youtube {
+        seek_seconds,
+        if seek_requires_youtube {
             "YouTube tab must be focused"
         } else {
             "anywhere"
         }
     );
-    println!("  keys   : q = quit (console)");
+    println!("  keys   : q / ESC = quit, d = toggle debug overlay");
     println!("  note   : click your video window first -- seeks only fire while it's focused");
     println!();
 
@@ -168,211 +739,47 @@ fn run_live(
         });
     }
 
-    let t0 = Instant::now();
-    let mut last_ts = -1i64;
-    let mut stop_reason = "quit (q)";
-    // v1's stats dict.
-    let mut frames = 0u64;
-    let mut hand_frames = 0u64;
-    let mut seeks = 0u64;
-    let mut scroll_events = 0u64;
-    let mut wheel = 0i64;
-    // Rolling 2 s window for the stage report.
-    let mut win_start = Instant::now();
-    let mut win_frames = 0u64;
-    let mut win_wait_ms = 0f64;
-    let mut win_decode_ms = 0f64;
-    let mut win_hand = 0u64;
-    let mut win_detects = 0u64;
-    let mut win_detect_ms = 0f64;
-    let mut win_landmark_ms = 0f64;
-    let mut win_landmark_n = 0u64;
-
-    'live: loop {
-        if quit.load(Ordering::SeqCst) {
-            break 'live;
-        }
-        let (rgb, w, h) = match capture.capture() {
-            Ok(v) => v,
-            Err(e) => {
-                stop_reason = "camera stopped delivering frames";
-                println!("[capture error] {e}");
-                break 'live;
-            }
-        };
-
-        let mut ts = t0.elapsed().as_millis() as i64;
-        if ts <= last_ts {
-            ts = last_ts + 1; // VIDEO mode demands strictly increasing stamps
-        }
-        last_ts = ts;
-
-        let out = match pipeline.process(&rgb, w, h) {
-            Ok(o) => o,
-            Err(e) => {
-                stop_reason = "inference error";
-                println!("[pipeline error] {e}");
-                break 'live;
-            }
-        };
-        frames += 1;
-        win_frames += 1;
-        win_wait_ms += capture.last_wait_ms;
-        win_decode_ms += capture.last_decode_ms;
-        if out.landmarks.is_some() {
-            hand_frames += 1;
-            win_hand += 1;
-        }
-        if !out.detect_ms.is_zero() {
-            win_detects += 1;
-            win_detect_ms += out.detect_ms.as_secs_f64() * 1e3;
-        }
-        if !out.landmark_ms.is_zero() {
-            win_landmark_n += 1;
-            win_landmark_ms += out.landmark_ms.as_secs_f64() * 1e3;
-        }
-
-        let landmarks = out.landmarks.as_ref().map(|lms| {
-            lms.iter()
-                .map(|l| Landmark::new(l[0] as f64, l[1] as f64))
-                .collect::<Vec<_>>()
-        });
-        let (on_youtube, _title) = ytd.check(ts, false);
-        let res = engine.frame(landmarks.as_deref(), ts, on_youtube);
-
-        // ---- act: scroll (anywhere) ---------------------------------------
-        if res.scroll_clicks != 0 {
-            if dry_run {
-                scroll_events += 1;
-                wheel += res.scroll_clicks as i64;
-                println!("[scroll] {:+} clicks (dry-run)", res.scroll_clicks);
-            } else {
-                // v1: failSafeCheck runs before the wheel event; on failure it
-                // stops without counting the event.
-                if input::failsafe_triggered(cfg.pyautogui_failsafe) {
-                    stop_reason = "pyautogui failsafe (mouse hit a screen corner)";
-                    break 'live;
-                }
-                input::scroll(res.scroll_clicks);
-                scroll_events += 1;
-                wheel += res.scroll_clicks as i64;
-                // real mode is HUD-silent, like v1 (console has no HUD yet).
-            }
-        }
-
-        // ---- act: seek (engine already YouTube-gates it) -------------------
-        if let Some(dir) = res.seek {
-            match seek_key_sequence(cfg.seek_seconds, dir.as_str(), &cfg.seek_keys) {
-                Ok(seq) => {
-                    let arrow = if dir.as_str() == "backward" { "-" } else { "+" };
-                    if dry_run {
-                        seeks += 1;
-                        println!(
-                            "[seek] {arrow}{}s ({}) (dry-run)",
-                            cfg.seek_seconds,
-                            seq.join(" + ")
-                        );
-                    } else {
-                        // v1: per key, 50ms gap, failSafeCheck before each
-                        // press; mid-sequence failure stops without stats or
-                        // the [seek] print (keys already sent stay sent).
-                        let mut aborted = false;
-                        for (i, key) in seq.iter().enumerate() {
-                            if i > 0 {
-                                std::thread::sleep(std::time::Duration::from_millis(50));
-                            }
-                            if input::failsafe_triggered(cfg.pyautogui_failsafe) {
-                                stop_reason = "pyautogui failsafe (mouse hit a screen corner)";
-                                aborted = true;
-                                break;
-                            }
-                            input::press(key);
-                        }
-                        if aborted {
-                            break 'live;
-                        }
-                        seeks += 1;
-                        println!(
-                            "[seek] {arrow}{}s ({})",
-                            cfg.seek_seconds,
-                            seq.join(" + ")
-                        );
-                    }
-                }
-                Err(e) => println!("[seek error] {e}"),
-            }
-        }
-        if let Some(blocked) = &res.seek_blocked {
-            println!("[seek blocked] {blocked}");
-        }
-        if let Some(side) = res.tap && res.seek.is_none() {
-            println!(
-                "[tap] {} side -- double-pinch again within {}ms",
-                side.as_str(),
-                cfg.double_tap_window_ms
-            );
-        }
-
-        if win_start.elapsed().as_secs_f64() >= 2.0 {
-            let secs = win_start.elapsed().as_secs_f64();
-            let fps = win_frames as f64 / secs;
-            let det_avg = if win_detects > 0 {
-                win_detect_ms / win_detects as f64
-            } else {
-                0.0
-            };
-            let lmk_avg = if win_landmark_n > 0 {
-                win_landmark_ms / win_landmark_n as f64
-            } else {
-                0.0
-            };
-            let wait_avg = if win_frames > 0 {
-                win_wait_ms / win_frames as f64
-            } else {
-                0.0
-            };
-            let decode_avg = if win_frames > 0 {
-                win_decode_ms / win_frames as f64
-            } else {
-                0.0
-            };
-            println!(
-                "[stats] {fps:.1} fps | hand {}% | wait {wait_avg:.1}ms | decode {decode_avg:.1}ms | detect {det_avg:.1}ms ({} runs) | landmark {lmk_avg:.1}ms | total {frames}",
-                if win_frames > 0 {
-                    win_hand * 100 / win_frames
-                } else {
-                    0
-                },
-                win_detects
-            );
-            win_start = Instant::now();
-            win_frames = 0;
-            win_wait_ms = 0.0;
-            win_decode_ms = 0.0;
-            win_hand = 0;
-            win_detects = 0;
-            win_detect_ms = 0.0;
-            win_landmark_ms = 0.0;
-            win_landmark_n = 0;
-        }
+    // v1 window placement: top-right, 480x360 (config-driven always-on-top).
+    let (screen_w, _) = input::screen_size();
+    let (wx, wy) = hud::window_position(screen_w as f32);
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("PinchFlick (q=quit, d=debug)")
+        .with_inner_size([480.0_f32, 360.0_f32])
+        .with_position([wx, wy]);
+    if always_on_top {
+        viewport = viewport.with_always_on_top();
     }
+    let options = eframe::NativeOptions {
+        viewport,
+        ..Default::default()
+    };
 
-    let elapsed = t0.elapsed().as_secs_f64().max(1e-6);
-    println!();
-    println!("Stopped: {stop_reason}");
-    println!(
-        "Summary: {frames} frames in {elapsed:.1}s ({:.1} fps), hand visible {hand_frames}/{frames}, seeks fired {seeks}, scroll events {scroll_events} ({wheel:+} wheel clicks)",
-        frames as f64 / elapsed
-    );
-    println!(
-        "Last focused window: {} -> YouTube: {}",
-        if ytd.title.is_empty() {
-            "(none)"
-        } else {
-            ytd.title.as_str()
+    let out: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let app = HudApp {
+        live: Arc::new(Mutex::new(live)),
+        quit: Arc::clone(&quit),
+        out: Arc::clone(&out),
+        dry_run,
+        paint: PaintFrame {
+            frame_w,
+            frame_h,
+            ..Default::default()
         },
-        if ytd.is_youtube { "yes" } else { "no" }
-    );
+        stop: None,
+        finished: false,
+        last_title: String::new(),
+    };
+
+    eframe::run_native(
+        "PinchFlick (q=quit, d=debug)",
+        options,
+        Box::new(move |_cc| Ok(Box::new(app))),
+    )
+    .map_err(|e| -> Box<dyn std::error::Error> { format!("eframe: {e}").into() })?;
+
+    if let Some(text) = out.lock().unwrap().take() {
+        print!("{text}");
+    }
     Ok(())
 }
 
@@ -1013,3 +1420,4 @@ fn dump_detector(anchors: &[f32], scores: &[f32]) {
         println!("  anchor #{i:04}: logit {v:8.3}  ->  p = {:.6}", sig(*v));
     }
 }
+
