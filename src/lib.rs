@@ -6,6 +6,7 @@
 
 pub mod config;
 pub mod gestures;
+pub mod selftest;
 pub mod sys;
 pub mod track;
 pub mod vision;

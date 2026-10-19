@@ -38,6 +38,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let live_mode = args.iter().any(|a| a == "--live");
     let dry_run = args.iter().any(|a| a == "--dry-run");
+    let selftest_mode = args.iter().any(|a| a == "--selftest");
     let config_path = args
         .iter()
         .position(|a| a == "--config")
@@ -48,6 +49,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .position(|a| a == "--camera")
         .and_then(|i| args.get(i + 1))
         .and_then(|s| s.parse::<i64>().ok());
+
+    // `--selftest` = v1's `python selftest.py`: 25 logic checks against
+    // synthetic landmarks, no camera and no ONNX runtime — handled before
+    // `ort::init()` so it runs on a machine with no models present. Exit 0 =
+    // ALL GREEN, 1 = failures printed. (CLI flag wiring is spike-gated like
+    // every other flag here; the checks themselves are the parity-tested
+    // code in `selftest.rs`, the exact functions `cargo test` wraps.)
+    if selftest_mode {
+        let failures = pinchflick_rs::selftest::run_and_print();
+        if failures > 0 {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
 
     let environment = ort::init().with_name("pinchflick-rs").build()?;
 

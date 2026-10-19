@@ -26,6 +26,7 @@ dump_out.txt
 # test-run scratch output (pattern, not an explicit list)
 *_run.txt
 *_err*.txt
+*_smoke*.txt
 phase*.txt
 final_verify.txt
 # M3.5 fps-diagnosis A/B artifacts (evidence lives in the ledger + VENDOR-NOTICE.md)

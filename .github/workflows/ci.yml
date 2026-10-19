@@ -1,0 +1,20 @@
+# M5 — GitHub Actions: windows-latest running `cargo test` (design doc §6).
+# The runner image ships rustup (MSVC) + Visual Studio, and the suite is
+# pure logic: no camera, no models, no window needed (the one #[ignore]d
+# test is the ../PinchFlick .task fixture, absent on a fresh clone). No
+# extra setup beyond checkout.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain versions
+        run: rustc --version; cargo --version
+      - name: cargo test (135 + 1 ignored)
+        run: cargo test
