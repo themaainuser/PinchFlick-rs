@@ -53,3 +53,8 @@ rev_*.txt
 # local-only gate evidence (screen captures - never pushed)
 evidence/
 
+
+# local runnable binaries (built via cargo; kept at root for daily use)
+pinchflick-rs.exe
+DirectML.dll
+
