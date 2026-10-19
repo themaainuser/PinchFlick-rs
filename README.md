@@ -187,7 +187,11 @@ cadence), release build / v1's shipped venv:
 
 fps comes from the `m5_*_smoke.txt` run summaries; CPU/RAM from the paired
 `m5_*_smoke_res.txt` sampler runs (method, PID, and interval recorded in
-each file).
+each file). For the representative **interactive** condition (hand actually
+in frame, real injection), one live run measured **278 MB peak / 0.95
+cores** with a hand visible 32% of frames — `real_scroll_gate_run.txt` +
+`real_scroll_gate_res_run.txt` — i.e. a visible hand costs roughly +11 MB
+and +0.11 cores over the no-hand condition above.
 
 Reading: the Rust build is **~4.6× smaller** and holds a **full-30-fps**
 loop (v1's real-world ~25 fps, measured here at 26.1), while v1 uses **~21%
