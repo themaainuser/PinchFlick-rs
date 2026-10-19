@@ -30,6 +30,7 @@
 //!   exact screen corners raises before an action is sent
 
 use windows::Win32::Foundation::POINT;
+use windows::Win32::UI::HiDpi::GetDpiForSystem;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     keybd_event, mouse_event, VkKeyScanA, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, MOUSEEVENTF_WHEEL,
 };
@@ -326,6 +327,24 @@ pub fn screen_size() -> (i32, i32) {
     let w = unsafe { GetSystemMetrics(SM_CXSCREEN) };
     let h = unsafe { GetSystemMetrics(SM_CYSCREEN) };
     (w, h)
+}
+
+/// System DPI scale as a multiplier (96 dpi = 1.0), for converting screen
+/// metrics into the logical points egui/winit windows are positioned in.
+/// This process reads `screen_size()` while still DPI-unaware (before winit
+/// declares awareness), so the metrics arrive already virtualized — divided
+/// by the (virtualized) system DPI this yields the point space directly; on
+/// a machine where a compat override pinned an aware context instead, the
+/// physical metrics divide down to the same points. Verified end-to-end:
+/// EnumWindows probe saw the HUD at rect (1036, 16) 494x398 visible +
+/// topmost = v1's `sw - 500` placement on a 1920x1080 @1.25x screen.
+pub fn system_dpi_scale() -> f32 {
+    let dpi = unsafe { GetDpiForSystem() };
+    if dpi == 0 {
+        1.0
+    } else {
+        dpi as f32 / 96.0
+    }
 }
 
 /// pyautogui `failSafeCheck`: raise (= stop) when the cursor sits in any of

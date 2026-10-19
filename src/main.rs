@@ -131,6 +131,10 @@ struct Live {
     on_youtube: bool,
     scroll_clicks: i32,
     landmarks: Vec<Landmark>,
+    /// Latest captured frame, already mirrored inside `capture()` (same
+    /// bytes v1 shows via cv2.imshow) — uploaded to the HUD texture each
+    /// frame so the preview shows the camera feed under the overlay.
+    frame_rgb: Vec<u8>,
     frame_w: f32,
     frame_h: f32,
 }
@@ -198,6 +202,7 @@ impl Live {
             on_youtube: false,
             scroll_clicks: 0,
             landmarks: Vec::new(),
+            frame_rgb: Vec::new(),
             cfg,
             engine,
             ytd,
@@ -233,6 +238,7 @@ impl Live {
                 return StepOutcome::Stop("inference error".to_string());
             }
         };
+        self.frame_rgb = rgb;
         self.frames += 1;
         self.win_frames += 1;
         self.win_wait_ms += self.capture.last_wait_ms;
@@ -427,6 +433,9 @@ struct HudApp {
     out: Arc<Mutex<Option<String>>>,
     dry_run: bool,
     paint: PaintFrame,
+    /// The preview texture (v1's cv2.imshow content): created on the first
+    /// frame, updated per frame with the latest captured RGB buffer.
+    tex: Option<egui::TextureHandle>,
     stop: Option<String>,
     finished: bool,
     last_title: String,
@@ -472,16 +481,29 @@ impl eframe::App for HudApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
                 self.last_title = title;
             }
+            // Preview texture: latest mirrored frame (v1's cv2.imshow feed),
+            // stretched by ui() onto the window rect like WINDOW_NORMAL.
+            let tw = live.frame_w as usize;
+            let th = live.frame_h as usize;
+            if tw > 0 && live.frame_rgb.len() == tw * th * 3 {
+                let img = egui::ColorImage::from_rgb([tw, th], &live.frame_rgb);
+                match &mut self.tex {
+                    Some(t) => t.set(img, egui::TextureOptions::LINEAR),
+                    None => {
+                        self.tex =
+                            Some(ctx.load_texture("pinchflick-frame", img, egui::TextureOptions::LINEAR));
+                    }
+                }
+            }
         }
 
         if self.stop.is_none() && self.quit.load(Ordering::SeqCst) {
-            // stop-reason wording diverges from v1 on purpose (deferred, M3.6):
-            // v1 says "quit key"; we keep "quit (q)" and say "(window closed)"
-            // only for the ✕ button.
+            // v1 wording for q/ESC (controller.py:168: stop_reason =
+            // "quit key"); the ✕ button has no v1 analog, so it says so.
             self.stop = Some(if window_closed {
                 "quit (window closed)"
             } else {
-                "quit (q)"
+                "quit key"
             }
             .to_string());
         }
@@ -513,7 +535,22 @@ impl eframe::App for HudApp {
             egui::pos2(rect.left() + x, rect.top() + y)
         };
 
-        painter.rect_filled(rect, 0.0, egui::Color32::BLACK);
+        // Preview: the camera feed (v1's cv2.imshow content), stretched to
+        // the window exactly like WINDOW_NORMAL; black until the first
+        // frame's texture exists.
+        match &self.tex {
+            Some(tex) => {
+                painter.image(
+                    tex.id(),
+                    rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+            }
+            None => {
+                painter.rect_filled(rect, 0.0, egui::Color32::BLACK);
+            }
+        }
 
         // Center divider (v1 controller.py:256).
         let mid = at((p.frame_w / 2.0, 0.0));
@@ -740,8 +777,18 @@ fn run_live(
     }
 
     // v1 window placement: top-right, 480x360 (config-driven always-on-top).
-    let (screen_w, _) = input::screen_size();
-    let (wx, wy) = hud::window_position(screen_w as f32);
+    // egui windows are positioned in POINTS: convert the (physical) metrics by
+    // the system DPI so v1's `sw - 500` lands 20px inside the edge instead of
+    // clipping off-screen right (observed at M4.4b before this conversion).
+    let (screen_px, screen_py) = input::screen_size();
+    let dpi_scale = input::system_dpi_scale();
+    let screen_w = screen_px as f32 / dpi_scale;
+    let screen_h = screen_py as f32 / dpi_scale;
+    let (wx, wy) = hud::window_position(screen_w);
+    println!(
+        "[display] screen {screen_px}x{screen_py}px @ {dpi_scale:.2}x \
+         -> {screen_w:.0}x{screen_h:.0}pt, window at ({wx}, {wy})"
+    );
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("PinchFlick (q=quit, d=debug)")
         .with_inner_size([480.0_f32, 360.0_f32])
@@ -765,6 +812,7 @@ fn run_live(
             frame_h,
             ..Default::default()
         },
+        tex: None,
         stop: None,
         finished: false,
         last_title: String::new(),
