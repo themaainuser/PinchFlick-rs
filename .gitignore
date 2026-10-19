@@ -49,3 +49,7 @@ readback_*.txt
 release_run*.txt
 rev_*.txt
 
+
+# local-only gate evidence (screen captures - never pushed)
+evidence/
+

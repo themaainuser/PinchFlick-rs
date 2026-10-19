@@ -16,10 +16,11 @@ and numbers as v1's `selftest.py`, plus one runner test = 135 green in
 Double-pinch = thumb + index finger together, apart, together again quickly
 (on the same side of the screen).
 
-> **Status (honest, per the design doc's §9):** v1 remains the daily driver.
-> Same-day measurements on the same machine (below) show the Rust build is
-> **faster and far smaller**, but v1 still uses **less CPU and RAM** — so this
-> repo is an honest write-up with a fully working tool, not a takeover.
+> **Status (updated 2026-10-19):** this Rust build is now the **daily
+> driver** (owner's decision — it's ~4.6× smaller, holds a steady 30 fps,
+> and ships as a single exe). v1 (`../PinchFlick`, Python + MediaPipe)
+> remains the verified **semantic reference** and still wins on CPU/RAM per
+> the same-machine numbers below — both are fully working tools.
 
 ## Quick start
 
@@ -195,9 +196,11 @@ and +0.11 cores over the no-hand condition above.
 
 Reading: the Rust build is **~4.6× smaller** and holds a **full-30-fps**
 loop (v1's real-world ~25 fps, measured here at 26.1), while v1 uses **~21%
-less CPU and ~12% less RAM**. Under the design doc's §9 rule ("wins on
-CPU/RAM *and* parity → v1's README gets a pointer; otherwise an honest
-write-up"), v1 stays the daily driver for now. Caveats: the summary column
+less CPU and ~12% less RAM**. The design doc's §9 rule would have kept v1
+as the daily driver on these numbers; on 2026-10-19 the owner chose this
+build as the daily driver anyway — size, fps, and the single-exe install
+outweigh the CPU/RAM delta — with v1 remaining the semantic reference.
+Caveats: the summary column
 includes each build's first-paint warmup; CPU/RAM depend on hand visibility
 (tracking policy throttles the detector while a hand is locked on), so treat
 these as measured indications, not a controlled benchmark.

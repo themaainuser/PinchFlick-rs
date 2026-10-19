@@ -168,6 +168,12 @@ tests/
 - If the Rust build wins on CPU/RAM and reaches parity, v1's README gets a
   pointer; if not, v1 ships on and this repo becomes an honest write-up.
 
+**Amendment (2026-10-19, owner's decision at closeout):** the measured
+numbers gave CPU/RAM to v1 and size/fps to the Rust build, so the rule above
+would have kept v1 primary. The owner overrode it — **the Rust build is the
+daily driver**; v1 remains the semantic reference; v1's README got the
+pointer either way. LICENSE: MIT.
+
 ## 10. Open for the builder
 
 Crate version pinning, exact M0 spike procedure (tract version/features),
