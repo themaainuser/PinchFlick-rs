@@ -22,13 +22,24 @@ use pinchflick_rs::sys::{hud, input, title::YouTubeDetector};
 use pinchflick_rs::track::{capture::Capture, inference::Pipeline};
 use eframe::egui;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() {
+    // v1 controller.py:333-348: config failures -> `Config error: ...` on
+    // stderr + exit 2; anything else -> `Fatal error: ...` + exit 1 (was
+    // Rust's default `Error: {:?}` + exit 1 for everything).
+    if let Err(e) = run_cli() {
+        let (line, code) = pinchflick_rs::cli::error_output(&*e);
+        eprintln!("{line}");
+        std::process::exit(code);
+    }
+}
+
+/// The whole CLI flow as a `Result` so `main` can apply v1's error lines
+/// and exit codes. (CLI wiring = declared spike like every flag here; the
+/// rules live in `cli::error_output` / `cli::frame_path` / `cli::implies_live`,
+/// unit-tested in `src/cli.rs`.)
+fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let frame_path = args
-        .iter()
-        .find(|a| !a.starts_with("--"))
-        .cloned()
-        .unwrap_or_else(|| "frame.png".into());
+    let frame_path = pinchflick_rs::cli::frame_path(&args);
     let detect_mode = args.iter().any(|a| a == "--detect");
     let landmarks_mode = args.iter().any(|a| a == "--landmarks");
     let video_iters: Option<usize> = args.iter().position(|a| a == "--video").map(|i| {
@@ -36,7 +47,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .and_then(|s| s.parse().ok())
             .unwrap_or(3)
     });
-    let live_mode = args.iter().any(|a| a == "--live");
+    // --camera/--config imply live mode: v1's argparse had no dev harness,
+    // so those flags always launched the live app (controller.py).
+    let live_mode = pinchflick_rs::cli::implies_live(&args);
     let dry_run = args.iter().any(|a| a == "--dry-run");
     let selftest_mode = args.iter().any(|a| a == "--selftest");
     let config_path = args

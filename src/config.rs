@@ -48,6 +48,9 @@ pub struct Config {
     pub frame_width: i64,
     pub frame_height: i64,
     pub mirror_display: bool,
+    /// Validated 1–2 like v1, but the runtime tracks **1** hand — v1's
+    /// shipped default, and all v1's controller consumes (it takes
+    /// `hand_landmarks[0]`, controller.py:192). See README differences.
     pub num_hands: i64,
     pub min_detection_confidence: f64,
     pub min_presence_confidence: f64,

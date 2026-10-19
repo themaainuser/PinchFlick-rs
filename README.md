@@ -118,11 +118,12 @@ validation messages; both apps can share one file.
 
 The full key tables (camera/tracking, scroll, seek, YouTube detection, misc —
 defaults and meanings) are in **[v1's README](../PinchFlick/README.md#configuration-configjson)**;
-every key, default, and meaning applies here unchanged. Differences:
+every key, default, and meaning maps over — with these differences:
 
 | Key | In this build |
 |---|---|
 | `model_path` | Accepted and validated (schema parity), but models always load from `models\` in the current folder |
+| `num_hands` | Validated like v1 (1–2), but the runtime tracks **1** hand — v1's shipped default, and v1's controller only consumes the first tracked hand anyway (`controller.py:192`) |
 | `show_debug_window` | Works — starts with the debug overlay on (there is no `--debug` flag yet) |
 | `always_on_top`, `pyautogui_failsafe` | Work — top-right always-on-top HUD; slam the mouse into a screen corner to stop |
 
@@ -142,8 +143,8 @@ every key, default, and meaning applies here unchanged. Differences:
 target\release\pinchflick-rs.exe --selftest        # 25 logic tests, no camera (ALL GREEN / exit 1)
 target\release\pinchflick-rs.exe --live            # real mode: gestures inject input
 target\release\pinchflick-rs.exe --live --dry-run  # print every action instead of injecting
-target\release\pinchflick-rs.exe --camera 1        # override camera index
-target\release\pinchflick-rs.exe --config my.json  # alternate config file
+target\release\pinchflick-rs.exe --camera 1        # override camera index (launches live, like v1)
+target\release\pinchflick-rs.exe --config my.json  # alternate config file (also launches live)
 ```
 
 There is no `--smoke N`/`--debug` flag yet (v1 has them); for a short
@@ -180,12 +181,16 @@ cadence), release build / v1's shipped venv:
 |---|---|---|
 | Install size | **349.5 MB** (venv 342.0 + app/model 7.5) | **75.4 MB** (exe 42.8 + DirectML.dll 17.7 + models 14.9) |
 | Frame rate | 26.1 fps (summary over 13.0 s) | **30.1 fps steady** (29.5–30.4 across 6 windows; 27.0 fps summary incl. first-paint warmup) |
-| Peak RAM | **233 MB** | 265 MB |
-| Steady CPU | **0.55 cores** of 12 | 0.87 cores of 12 |
+| Peak RAM | **234 MB** | 267 MB |
+| Steady CPU | **0.66 cores** of 12 | 0.84 cores of 12 |
 | Decode (frame → RGB) | — | 0.77 ms avg |
 
+fps comes from the `m5_*_smoke.txt` run summaries; CPU/RAM from the paired
+`m5_*_smoke_res.txt` sampler runs (method, PID, and interval recorded in
+each file).
+
 Reading: the Rust build is **~4.6× smaller** and holds a **full-30-fps**
-loop (v1's real-world ~25 fps, measured here at 26.1), while v1 uses **~35%
+loop (v1's real-world ~25 fps, measured here at 26.1), while v1 uses **~21%
 less CPU and ~12% less RAM**. Under the design doc's §9 rule ("wins on
 CPU/RAM *and* parity → v1's README gets a pointer; otherwise an honest
 write-up"), v1 stays the daily driver for now. Caveats: the summary column
@@ -193,9 +198,15 @@ includes each build's first-paint warmup; CPU/RAM depend on hand visibility
 (tracking policy throttles the detector while a hand is locked on), so treat
 these as measured indications, not a controlled benchmark.
 
-The perf gate history is in the ledger: M1 measured stage-by-stage
-(detector ~8 ms, landmarks ~6–8 ms per frame inside the 33 ms budget), M4
-verified 30 fps *with* the HUD + live camera texture on.
+Two design-doc §2 size targets are missed and recorded as missed (ledger):
+exe size **42.8 MB** vs the ≤ 25 MB target (the M0 ort route carries a
+17.7 MB DirectML.dll) and steady RAM **267 MB** vs the < 200 MB target.
+
+The perf gate history is in the ledger: M1 bench-measured the stages
+(detector 5.67 ms, landmark 3.82 ms per inference); in the live loop the
+detector runs at 7–10 ms and landmarks cost 5.3 ms with a hand visible,
+holding 29.6–30.5 fps (M3.6 evidence run), and M4 verified 30 fps *with*
+the HUD + live camera texture on.
 
 ## Troubleshooting
 
@@ -218,12 +229,16 @@ verified 30 fps *with* the HUD + live camera texture on.
 
 ## Development
 
-- **Tests:** `cargo test` — 135 passing + 1 ignored. The ignored one is the
+- **Tests:** `cargo test` — 144 passing + 1 ignored. The ignored one is the
   M0 `.task`-extraction fixture (`cargo test -- --ignored` runs it where
   `../PinchFlick/hand_landmarker.task` exists — it's absent on a fresh clone,
   hence ignored). The 25 v1 parity checks live in `src/selftest.rs` (their
   single source of truth, also what `--selftest` runs);
   `tests/parity.rs` wraps them as the M2 gate.
+- **Dev probes:** `--detect` / `--landmarks` (single-frame model dumps) and
+  `--video [N]` (default 3 — the unattended frame loop the gates used) run
+  against a still image; they take no config (`--config`/`--camera` imply
+  `--live` instead, like v1). The live app is `--live`.
 - **CI:** `.github/workflows/ci.yml` runs `cargo test` on `windows-latest`
   for every push/PR (the repo has no remote yet — it activates on first push).
 - **Process:** test-driven for pure logic; OS/camera/injection wiring is

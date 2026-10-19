@@ -47,6 +47,18 @@ pub struct Pipeline {
     min_tracking_confidence: f32,
 }
 
+/// Model-output lookup that errors instead of panicking: `[]` indexing on a
+/// renamed/wrong model file used to abort the live loop with an index panic.
+/// (Wiring-side hardening — ort output maps need a real session to build, so
+/// this isn't unit-tested; happy paths are gate-run territory, like the rest
+/// of the inference wiring.)
+fn missing_output(name: &str) -> Box<dyn std::error::Error> {
+    format!(
+        "model output \"{name}\" not found - wrong model file in models\\? (scripts\\download-models.ps1)"
+    )
+    .into()
+}
+
 impl Pipeline {
     pub fn new(
         environment: &Environment,
@@ -117,11 +129,17 @@ impl Pipeline {
         // presence flag (raw, activation NONE), Identity_2 = handedness
         // score, Identity_3 = [1,63] world landmarks.
         let landmark_raw = {
-            let (_, data) = lm_outputs["Identity"].try_extract_tensor::<f32>()?;
+            let (_, data) = lm_outputs
+                .get("Identity")
+                .ok_or_else(|| missing_output("Identity"))?
+                .try_extract_tensor::<f32>()?;
             data.to_vec()
         };
         let presence_raw = {
-            let (_, data) = lm_outputs["Identity_1"].try_extract_tensor::<f32>()?;
+            let (_, data) = lm_outputs
+                .get("Identity_1")
+                .ok_or_else(|| missing_output("Identity_1"))?
+                .try_extract_tensor::<f32>()?;
             data[0]
         };
         drop(lm_outputs);
@@ -163,8 +181,14 @@ impl Pipeline {
         let tensor = Tensor::from_array(([1i64, 192, 192, 3], input))?;
         let outputs = self.det_session.run(ort::inputs![tensor])?;
         let (boxes, scores) = {
-            let b = outputs["Identity"].try_extract_tensor::<f32>()?;
-            let s = outputs["Identity_1"].try_extract_tensor::<f32>()?;
+            let b = outputs
+                .get("Identity")
+                .ok_or_else(|| missing_output("Identity"))?
+                .try_extract_tensor::<f32>()?;
+            let s = outputs
+                .get("Identity_1")
+                .ok_or_else(|| missing_output("Identity_1"))?
+                .try_extract_tensor::<f32>()?;
             (b.1.to_vec(), s.1.to_vec())
         };
         drop(outputs);

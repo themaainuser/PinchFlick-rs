@@ -748,7 +748,10 @@ pub fn run_all() -> Vec<(&'static str, Result<(), String>)> {
 }
 
 /// v1's `selftest.py` runner output (PASS/FAIL lines, `N/N passed -- ALL
-/// GREEN`, honest per-check messages). Returns the failure count; the caller
+/// GREEN`, honest per-check messages). One deliberate difference: the FAIL
+/// line carries the panic message only — Python also prefixes the exception
+/// class (`AssertionError: ...`), for which Rust's panic payload has no
+/// equivalent. Returns the failure count; the caller
 /// decides the exit code. Panic-hook noise is suppressed around the run so a
 /// failing check prints exactly one FAIL line — CLI path only, never called
 /// from `cargo test` (which keeps the default hook for its own reports).

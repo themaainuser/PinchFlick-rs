@@ -65,17 +65,23 @@ foreach ($f in $files) {
 
     Write-Host "GET      $($f.Name)"
     $tmp = "$target.download"
-    Invoke-WebRequest -Uri "$baseUrl/$($f.Name)" -OutFile $tmp -UseBasicParsing
-    $hash = (Get-FileHash -LiteralPath $tmp -Algorithm SHA256).Hash.ToLower()
-    if ($hash -ne $f.Sha256) {
-        Remove-Item -LiteralPath $tmp -Force
-        Write-Host "FAILED   $($f.Name)  SHA256 mismatch after download:"
-        Write-Host "         got  $hash"
-        Write-Host "         want $($f.Sha256)"
-        exit 1
+    try {
+        Invoke-WebRequest -Uri "$baseUrl/$($f.Name)" -OutFile $tmp -UseBasicParsing
+        $hash = (Get-FileHash -LiteralPath $tmp -Algorithm SHA256).Hash.ToLower()
+        if ($hash -ne $f.Sha256) {
+            Write-Host "FAILED   $($f.Name)  SHA256 mismatch after download:"
+            Write-Host "         got  $hash"
+            Write-Host "         want $($f.Sha256)"
+            exit 1
+        }
+        Move-Item -LiteralPath $tmp -Destination $target -Force
+        Write-Host "OK       $($f.Name)  (downloaded, SHA256 verified)"
     }
-    Move-Item -LiteralPath $tmp -Destination $target -Force
-    Write-Host "OK       $($f.Name)  (downloaded, SHA256 verified)"
+    finally {
+        # A network drop mid-download must not leave a partial file behind.
+        # (After success Move-Item already consumed $tmp -> this is a no-op.)
+        if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force }
+    }
 }
 
 if ($failed) {

@@ -4,6 +4,7 @@
 //! in, decisions out), no camera / no inference / no OS input — that is what
 //! lets the 25 v1 selftests run as `cargo test`.
 
+pub mod cli;
 pub mod config;
 pub mod gestures;
 pub mod selftest;
